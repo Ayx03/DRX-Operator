@@ -6,7 +6,7 @@ import subprocess
 
 from textual.app import App, ComposeResult, SkipAction
 from textual.binding import Binding
-from textual.containers import Container
+from textual.containers import Container, Horizontal
 from textual.widgets import Header
 
 from drx_agent.event_bus import EventBus, EventType, Event
@@ -14,6 +14,7 @@ from drx_agent.tui.chat_panel import ChatPanel
 from drx_agent.tui.sidebar import Sidebar
 from drx_agent.tui.composer import Composer
 from drx_agent.tui.footer import StatusFooter
+from drx_agent.tui.ring import RingIndicator
 from drx_agent.tui.transcript_screen import TranscriptScreen
 from drx_agent.tui.command_palette import CommandPalette
 
@@ -46,6 +47,12 @@ class DrxAgentApp(App):
     """DRX-Operator main TUI application"""
 
     CSS = """
+    #footer-row {
+        height: 1;
+    }
+    #footer-row StatusFooter {
+        width: 1fr;
+    }
     #main-container {
         layout: horizontal;
         height: 1fr;
@@ -185,7 +192,9 @@ class DrxAgentApp(App):
                 yield ChatPanel(self.event_bus)
             yield Sidebar(self.event_bus)
         yield Composer(self.event_bus)
-        yield StatusFooter(self.event_bus)
+        with Horizontal(id="footer-row"):
+            yield StatusFooter(self.event_bus)
+            yield RingIndicator(self.event_bus)
 
     async def on_mount(self) -> None:
         self._main_screen = self.screen
