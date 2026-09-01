@@ -6,7 +6,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Static
 
 from drx_agent.event_bus import EventBus, EventType, Event
 
@@ -21,8 +21,10 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-class RingIndicator(Button):
+class RingIndicator(Static):
     """Bottom-right circular status ring; click opens the metrics menu."""
+
+    can_focus = True
 
     DEFAULT_CSS = """
     RingIndicator {
@@ -85,21 +87,24 @@ class RingIndicator(Button):
         if self._busy:
             if time.time() - self._last_activity > 5:
                 self._busy = False
-                self.label = "○"
+                self.update("○")
                 return
             self._frame = (self._frame + 1) % len(_SPIN_FRAMES)
-            self.label = _SPIN_FRAMES[self._frame]
+            self.update(_SPIN_FRAMES[self._frame])
         else:
-            self.label = "○"
+            self.update("○")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_click(self, event) -> None:
         self.app.push_screen(MetricsScreen(self._metrics))
 
 
 class MetricsScreen(ModalScreen):
     """Secondary menu: cache hit rate + token usage + cost."""
 
-    BINDINGS = [Binding("escape", "app.pop_screen", "关闭")]
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "关闭"),
+        Binding("q", "app.pop_screen", "关闭"),
+    ]
 
     DEFAULT_CSS = """
     MetricsScreen {
@@ -140,6 +145,6 @@ class MetricsScreen(ModalScreen):
                 f"rate: {m['rate']} r/min",
                 f"mode: {m['mode']}",
                 "",
-                "[Esc] 关闭",
+                "[Esc/q] 关闭",
             ]
         )
