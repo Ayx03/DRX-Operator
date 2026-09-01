@@ -27,8 +27,8 @@ class StatusFooter(Static):
     """Bottom status bar: cost/cache/rate/active targets/tokens."""
 
     DEFAULT_RENDER = (
-        "cost: $0.0000 | tokens: 0 in / 0 out / 0 total | "
-        "cache: 0 (0.0% 命中) | rate: 0 r/min | targets: 0"
+        "cost: $0.0000 | 缓存命中: 0 (0.0%) | "
+        "tokens: 0 in / 0 out / 0 total | rate: 0 r/min | targets: 0"
     )
 
     def __init__(self, event_bus: EventBus):
@@ -63,7 +63,7 @@ class StatusFooter(Static):
             if k in data:
                 self._state[k] = data[k]
         if "text" in data:
-            self._state["text"] = str(data["text"])[:48]
+            self._state["text"] = str(data["text"])[:24]
         self._refresh()
 
     def _build_text(self) -> str:
@@ -76,11 +76,11 @@ class StatusFooter(Static):
         parts = [
             f"[bold {mode_style}]{s['mode'].upper()}[/]",
             f"[#3fb950]cost:[/] {s['cost']}",
+            f"[#8b949e]缓存命中:[/] {_fmt_tokens(s['cache_hits'])} "
+            f"({hit_pct:.1f}%)",
             f"[#58a6ff]tokens:[/] {_fmt_tokens(s['tokens_in'])} in / "
             f"{_fmt_tokens(s['tokens_out'])} out / "
             f"{_fmt_tokens(s['tokens_total'])} total",
-            f"[#8b949e]cache:[/] {_fmt_tokens(s['cache_hits'])} "
-            f"({hit_pct:.1f}% 命中)",
             f"[#d2a8ff]rate:[/] {s['rate']} r/min",
             f"[#f0883e]targets:[/] {s['active_targets']}",
         ]
