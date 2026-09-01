@@ -26,7 +26,10 @@ def _visible_len(markup: str) -> int:
 class StatusFooter(Static):
     """Bottom status bar: cost/cache/rate/active targets/tokens."""
 
-    DEFAULT_RENDER = "cost: $0.0000 | tokens: 0 in / 0 out | cache: 0 | rate: 0 r/min | targets: 0"
+    DEFAULT_RENDER = (
+        "cost: $0.0000 | tokens: 0 in / 0 out / 0 total | "
+        "cache: 0 (0.0% 命中) | rate: 0 r/min | targets: 0"
+    )
 
     def __init__(self, event_bus: EventBus):
         super().__init__(self.DEFAULT_RENDER, markup=True)
@@ -46,6 +49,7 @@ class StatusFooter(Static):
 
     def on_mount(self) -> None:
         self.event_bus.subscribe(EventType.STATUS_UPDATE, self._on_status)
+        self._refresh()
 
     def on_resize(self, event) -> None:
         self._refresh()
