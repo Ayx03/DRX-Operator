@@ -65,12 +65,18 @@ class StatusFooter(Static):
     def _build_text(self) -> str:
         s = self._state
         mode_style = "#f0883e" if s["mode"] == "plan" else "#3fb950"
+        hit_pct = (
+            (s["cache_hits"] / s["tokens_in"] * 100.0)
+            if s["tokens_in"] else 0.0
+        )
         parts = [
             f"[bold {mode_style}]{s['mode'].upper()}[/]",
             f"[#3fb950]cost:[/] {s['cost']}",
             f"[#58a6ff]tokens:[/] {_fmt_tokens(s['tokens_in'])} in / "
-            f"{_fmt_tokens(s['tokens_out'])} out",
-            f"[#8b949e]cache:[/] {_fmt_tokens(s['cache_hits'])}",
+            f"{_fmt_tokens(s['tokens_out'])} out / "
+            f"{_fmt_tokens(s['tokens_total'])} total",
+            f"[#8b949e]cache:[/] {_fmt_tokens(s['cache_hits'])} "
+            f"({hit_pct:.1f}% 命中)",
             f"[#d2a8ff]rate:[/] {s['rate']} r/min",
             f"[#f0883e]targets:[/] {s['active_targets']}",
         ]

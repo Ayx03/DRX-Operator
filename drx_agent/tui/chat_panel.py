@@ -211,6 +211,30 @@ class ToolCard(Collapsible):
         return t
 
 
+class StreamingCursor(Static):
+    """Blinking typewriter cursor shown while the agent is streaming."""
+
+    DEFAULT_CSS = """
+    StreamingCursor {
+        height: auto;
+        width: 3;
+        margin: 0 0 1 0;
+        color: #58a6ff;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__("▍")
+        self._on = True
+
+    def on_mount(self) -> None:
+        self.set_interval(0.5, self._blink)
+
+    def _blink(self) -> None:
+        self._on = not self._on
+        self.update("▍" if self._on else " ")
+
+
 class MessageBubble(Static):
     """One chat message. Body can grow incrementally for streaming."""
 
@@ -295,6 +319,8 @@ class ChatPanel(VerticalScroll):
         self.event_bus = event_bus
         self._streams: dict[str, MessageBubble] = {}
         self._open_tools: dict[int, ToolCard] = {}
+        self._cursor: StreamingCursor | None = None
+        self._active_streams: set[str] = set()
         self._setup_subscriptions()
 
     def on_mount(self) -> None:
@@ -383,12 +409,29 @@ class ChatPanel(VerticalScroll):
         if is_agent:
             bubble.finalize()
 
+    def _ensure_cursor(self) -> None:
+        if self._cursor is None:
+            self._cursor = StreamingCursor()
+            try:
+                self.mount(self._cursor)
+            except Exception:
+                self._cursor = None
+
+    def _remove_cursor(self) -> None:
+        if self._cursor is not None:
+            try:
+                self._cursor.remove()
+            except Exception:
+                pass
+            self._cursor = None
+
     def _handle_stream(self, data: dict) -> None:
         sid = data.get("stream_id")
         if not sid:
             return
 
         if data.get("final"):
+            self._active_streams.discard(sid)
             bubble = self._streams.pop(sid, None)
             if bubble is not None:
                 # Snap to the agent's full text if provided (defends against delta loss).
@@ -398,6 +441,8 @@ class ChatPanel(VerticalScroll):
                 bubble.finalize()
                 if self._user_is_near_bottom():
                     self.call_after_refresh(self.scroll_end, animate=False)
+            if not self._active_streams:
+                self._remove_cursor()
             return
 
         delta = data.get("delta", "")
@@ -416,6 +461,8 @@ class ChatPanel(VerticalScroll):
             self._streams[sid] = bubble
             self._append(bubble)
         bubble.append(delta)
+        self._active_streams.add(sid)
+        self._ensure_cursor()
         if self._user_is_near_bottom():
             self.call_after_refresh(self.scroll_end, animate=False)
 
