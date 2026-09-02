@@ -51,9 +51,9 @@ def _build_one_provider(spec: dict):
         return None
 
     config = LLMConfig(
-        model=spec.get("model", "deepseek-chat"),
+        model=os.environ.get("DRX_LLM_MODEL") or spec.get("model", "deepseek-chat"),
         api_key=api_key,
-        base_url=spec.get("base_url", ""),
+        base_url=os.environ.get("DRX_LLM_BASE_URL") or spec.get("base_url", ""),
         temperature=float(spec.get("temperature", 0.7)),
         max_tokens=int(spec.get("max_tokens", 4096)),
     )
