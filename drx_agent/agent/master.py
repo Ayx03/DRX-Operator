@@ -2234,6 +2234,17 @@ class MasterAgent:
             status=status,
             verified=status in ("confirmed", "exploited"),
         )
+        if status in ("confirmed", "exploited") and not evidence:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "无证据不得标记 confirmed/exploited（no proof, no finding）。"
+                        "请先用工具取得实证并放入 evidence，否则只能记 suspected。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
         self.knowledge_base.add_finding(host, finding)
         board_section = "hypotheses" if status == "suspected" else "findings"
         self.blackboard.add(board_section, f"{host}: {claim[:120]} [{status}]", author="master")
@@ -2247,6 +2258,23 @@ class MasterAgent:
         claim = args.get("claim") or ""
         status = args.get("status") or ""
         superseded_by = args.get("superseded_by") or ""
+        if status in ("confirmed", "exploited"):
+            target = None
+            for f_host, f_obj in self.knowledge_base.all_findings():
+                if f_host == host and claim.lower() in f_obj.claim.lower():
+                    target = f_obj
+                    break
+            if target is not None and not target.evidence:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            "无证据不得晋升 confirmed/exploited（no proof, no finding）。"
+                            "请先补 evidence 再晋升，或维持 suspected。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
         finding = self.knowledge_base.update_finding_status(
             host, claim, status, superseded_by
         )
