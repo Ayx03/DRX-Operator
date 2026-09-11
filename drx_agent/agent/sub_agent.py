@@ -59,6 +59,7 @@ class SubAgent:
         max_iterations: int = 12,
         parallel_tool_calls: bool = True,
         usage_callback: Optional[Callable[[Optional[dict], Optional[str]], None]] = None,
+        llm_call_timeout: float = 600.0,
     ) -> None:
         self.agent_id = f"{agent_type}-{uuid.uuid4().hex[:4]}"
         self.agent_type = agent_type
@@ -73,6 +74,7 @@ class SubAgent:
         self.max_iterations = max_iterations
         self.parallel_tool_calls = parallel_tool_calls
         self.usage_callback = usage_callback
+        self.llm_call_timeout = llm_call_timeout
         self.status = SubAgentStatus.QUEUED
         self._interrupt = False
 
@@ -159,38 +161,48 @@ class SubAgent:
             saw_error = False
 
             try:
-                async for ev in self.llm_provider.chat(
-                    messages, tools=self.tool_schemas, stream=False
-                ):
-                    if self._interrupt:
-                        error_seen = self._mark_cancelled(error_seen)
-                        break
-                    kind = getattr(ev, "type", None)
-                    kind_value = kind.value if hasattr(kind, "value") else kind
-                    if kind_value == "text" and ev.content:
-                        text_parts.append(ev.content)
-                    elif kind_value == "tool_call":
-                        pending_calls.append({
-                            "id": (ev.metadata or {}).get("tool_call_id", ""),
-                            "name": ev.tool_name,
-                            "input": ev.tool_input or {},
-                        })
-                    elif kind_value == "error":
-                        error_seen = ev.content or "unknown LLM error"
-                        saw_error = True
-                        break
-                    elif kind_value == "done":
-                        meta = ev.metadata or {}
-                        assistant_msg = meta.get("assistant_message")
-                        if self.usage_callback is not None:
-                            try:
-                                self.usage_callback(meta.get("usage"), meta.get("model"))
-                            except Exception:
-                                logger.exception("sub-agent usage_callback failed")
-                        break
+                async def _consume():
+                    nonlocal text_parts, pending_calls, assistant_msg, saw_error, error_seen
+                    async for ev in self.llm_provider.chat(
+                        messages, tools=self.tool_schemas, stream=False
+                    ):
+                        if self._interrupt:
+                            error_seen = self._mark_cancelled(error_seen)
+                            break
+                        kind = getattr(ev, "type", None)
+                        kind_value = kind.value if hasattr(kind, "value") else kind
+                        if kind_value == "text" and ev.content:
+                            text_parts.append(ev.content)
+                        elif kind_value == "tool_call":
+                            pending_calls.append({
+                                "id": (ev.metadata or {}).get("tool_call_id", ""),
+                                "name": ev.tool_name,
+                                "input": ev.tool_input or {},
+                            })
+                        elif kind_value == "error":
+                            error_seen = ev.content or "unknown LLM error"
+                            saw_error = True
+                            break
+                        elif kind_value == "done":
+                            meta = ev.metadata or {}
+                            assistant_msg = meta.get("assistant_message")
+                            if self.usage_callback is not None:
+                                try:
+                                    self.usage_callback(meta.get("usage"), meta.get("model"))
+                                except Exception:
+                                    logger.exception("sub-agent usage_callback failed")
+                            break
+                await asyncio.wait_for(_consume(), timeout=self.llm_call_timeout)
             except asyncio.CancelledError:
                 error_seen = self._mark_cancelled(error_seen)
                 break
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Sub-agent %s LLM call timed out after %ss",
+                    self.agent_id, self.llm_call_timeout,
+                )
+                error_seen = f"LLM call timed out after {self.llm_call_timeout}s"
+                saw_error = True
             except Exception as exc:
                 logger.exception("Sub-agent %s LLM call failed", self.agent_id)
                 error_seen = str(exc)

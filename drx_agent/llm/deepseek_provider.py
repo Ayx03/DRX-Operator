@@ -35,6 +35,8 @@ class DeepSeekProvider(LLMProvider):
             self.client = AsyncOpenAI(
                 api_key=config.api_key,
                 base_url=config.base_url or "https://api.deepseek.com",
+                timeout=120.0,
+                max_retries=0,
             )
         except ImportError:
             raise LLMError("openai package not installed. Run: pip install openai")

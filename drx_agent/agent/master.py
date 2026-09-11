@@ -46,6 +46,33 @@ DESTROY_CONFIRMATION_PHRASE = "I CONFIRM DESTRUCTIVE ACTION"
 # Observer review with a causal replay of recent history (no auto-kill).
 STUCK_TICK_THRESHOLD = 6
 
+# ---- Judge 层（纯判断，不执行）：对齐 Cairn "在图上做判断，不做任何执行" ----
+_JUDGE_TOOL_NAMES = (
+    "intent_add", "intent_kill", "intent_done", "intent_list",
+    "blackboard_write", "blackboard_read", "list_findings",
+    "record_finding", "update_finding_status", "update_target",
+)
+
+JUDGE_SYSTEM_PROMPT = """你在 Fact-Intent 图上做面向目标的判断，不做任何执行。
+
+下方消息里有当前全图：已确认事实（知识库 Findings/黑板）与探索意图队列（Frontier）。
+先读懂全图、把握整体进展，再判断下一步。
+
+判断两件事：
+1. 已有事实是否已满足目标。满足则用 intent_done 收束相关意图；未满足则继续。
+2. 未满足则据当前事实决定下一步：用 intent_add 开探索方向。
+
+纪律：
+- 只依据图中事实判断，不臆造；没有证据的推断不要当成事实。
+- 只规划眼前一步，不预先铺开整条路线；后续随新事实每轮再定。
+- intent 是即时的一步动作：hypothesis 是断言、action 是验证方式，不写分步剧本、不复述已有信息。
+- 无 open intent 时（冷启动或管道空转），开 2-4 条相邻但互补的方向快速起量。
+- 已有事实可据分化时，各 intent 覆盖不同维度、不重叠。
+- 方向失效用 intent_kill 并写明原因（为什么走不通）。
+- 汇总/报告类意图放最后：仅当没有其他实质探索方向在途或待开时才开。
+- 你**不能执行任何攻击动作**（没有 shell/http/文件工具）——只做图决策。
+"""
+
 
 class MasterAgent:
     """Autonomous master agent driving a ReAct loop; integrates EventBus,
@@ -102,6 +129,9 @@ class MasterAgent:
         self._stuck_ticks: int = 0
         self._stuck_fact_baseline: int = 0
         self._pending_observer_msg: str | None = None
+        # LLM 单次调用安全网超时（provider 层已有 120s 无数据超时 + Resilient 重试链，
+        # 此值须高于重试链最坏时长，防真正的静默挂起）。
+        self.llm_call_timeout: float = 600.0
         self.swarm_mode: bool = False
         self._sub_exec_depth: int = 0
         self._script_counter = 0
@@ -2314,6 +2344,71 @@ class MasterAgent:
             )
         ]
         return json.dumps({"intents": intents}, ensure_ascii=False)
+
+    def _judge_graph_view(self) -> str:
+        """Judge 看到的全图：事实（Findings/黑板）+ 意图队列 + 死路。"""
+        findings = []
+        for host, f in self.knowledge_base.all_findings()[:30]:
+            findings.append(f"- [{f.status}] {host}: {f.claim[:120]}")
+        facts_block = "\n".join(findings) or "(暂无已确认事实)"
+        dead = self.frontier.dead_ends()[-8:]
+        dead_block = "\n".join(
+            f"- {d.hypothesis} — {d.reason}" for d in dead
+        ) or "(无)"
+        return (
+            "【已确认事实 Facts】\n" + facts_block + "\n\n"
+            + self.frontier.view(2000) + "\n\n"
+            + "【已排除方向 DeadEnds（禁止重复）】\n" + dead_block
+        )
+
+    async def run_judge_turn(self, context: str = "") -> str:
+        """纯判断层：只读图 + 图操作工具，不执行任何攻击动作。
+
+        返回本轮文本（判断理由），图操作已通过 _execute_tool 生效。
+        """
+        if self.llm_provider is None:
+            return ""
+        graph = self._judge_graph_view()
+        user_content = (context + "\n\n" if context else "") + graph
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        tools = [
+            t for t in self._build_tool_schemas()
+            if t["function"]["name"] in _JUDGE_TOOL_NAMES
+        ]
+        text_parts: list[str] = []
+        pending: list[dict] = []
+        try:
+            async def _consume():
+                async for ev in self.llm_provider.chat(messages, tools=tools, stream=False):
+                    kv = getattr(ev.type, "value", ev.type)
+                    if kv == "text" and ev.content:
+                        text_parts.append(ev.content)
+                    elif kv == "tool_call":
+                        pending.append({
+                            "name": ev.tool_name,
+                            "input": ev.tool_input or {},
+                        })
+                    elif kv == "error":
+                        break
+                    elif kv == "done":
+                        msg = (ev.metadata or {}).get("assistant_message") or {}
+                        content = msg.get("content") or ""
+                        if content and not text_parts:
+                            text_parts.append(content)
+                        break
+            await asyncio.wait_for(_consume(), timeout=self.llm_call_timeout)
+        except Exception as exc:
+            logger.exception("Judge turn failed: %s", exc)
+            return ""
+        for call in pending:
+            try:
+                await self._execute_tool(call["name"], call["input"])
+            except Exception:
+                logger.exception("Judge tool %s failed", call["name"])
+        return "".join(text_parts).strip()
 
     def _focused_context(self, intent_id: str, scope: str | None = None) -> str:
         refs = self.frontier.supporting_refs(intent_id, scope=scope)
@@ -4633,30 +4728,46 @@ class MasterAgent:
             stream_opened = False
 
             try:
-                async for ev in self.llm_provider.chat(
-                    request_messages, tools=tools, stream=True
-                ):
-                    kind = getattr(ev, "type", None)
-                    kind_value = kind.value if hasattr(kind, "value") else kind
-                    if kind_value == "text":
-                        if ev.content:
-                            text_parts.append(ev.content)
-                            self._publish_stream_delta(stream_id, ev.content, stream_opened)
-                            stream_opened = True
-                    elif kind_value == "tool_call":
-                        pending_calls.append({
-                            "id": (ev.metadata or {}).get("tool_call_id", ""),
-                            "name": ev.tool_name,
-                            "input": ev.tool_input or {},
-                        })
-                    elif kind_value == "error":
-                        error_seen = ev.content or "unknown LLM error"
-                        break
-                    elif kind_value == "done":
-                        assistant_message = (ev.metadata or {}).get("assistant_message")
-                        meta = ev.metadata or {}
-                        self._record_usage(meta.get("usage"), meta.get("model"))
-                        break
+                async def _consume():
+                    nonlocal text_parts, pending_calls, assistant_message, error_seen, stream_opened
+                    async for ev in self.llm_provider.chat(
+                        request_messages, tools=tools, stream=True
+                    ):
+                        kind = getattr(ev, "type", None)
+                        kind_value = kind.value if hasattr(kind, "value") else kind
+                        if kind_value == "text":
+                            if ev.content:
+                                text_parts.append(ev.content)
+                                self._publish_stream_delta(stream_id, ev.content, stream_opened)
+                                stream_opened = True
+                        elif kind_value == "tool_call":
+                            pending_calls.append({
+                                "id": (ev.metadata or {}).get("tool_call_id", ""),
+                                "name": ev.tool_name,
+                                "input": ev.tool_input or {},
+                            })
+                        elif kind_value == "error":
+                            error_seen = ev.content or "unknown LLM error"
+                            break
+                        elif kind_value == "done":
+                            assistant_message = (ev.metadata or {}).get("assistant_message")
+                            meta = ev.metadata or {}
+                            self._record_usage(meta.get("usage"), meta.get("model"))
+                            break
+                await asyncio.wait_for(_consume(), timeout=self.llm_call_timeout)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "LLM call timed out after %ss (no response)", self.llm_call_timeout
+                )
+                if stream_opened:
+                    self._publish_stream_end(stream_id)
+                self.event_bus.publish(
+                    Event(
+                        type=EventType.ERROR,
+                        data={"message": f"LLM 调用超时（{self.llm_call_timeout}s 无响应），已中止本轮"},
+                    )
+                )
+                return
             except Exception as exc:
                 logger.exception("LLM call failed")
                 if stream_opened:
@@ -5116,6 +5227,7 @@ class MasterAgent:
         target: str,
         task: str,
         priority: TaskPriority = TaskPriority.RECON,
+        bind_intent: str | None = None,
     ) -> SubAgentResult:
         
         await self.scheduler.wait_for_slot()
@@ -5188,13 +5300,16 @@ class MasterAgent:
         findings_before = self.knowledge_base.finding_total()
         targets_before = {t["host"] for t in self.knowledge_base.list_targets()}
 
-        intent_id = self.frontier.add_intent(
-            hypothesis=task[:200],
-            action=f"{agent_type}@{target}",
-            priority=priority.value,
-            max_steps=sub.max_iterations,
-            expiry_s=float(sub.ttl),
-        )
+        if bind_intent:
+            intent_id = bind_intent
+        else:
+            intent_id = self.frontier.add_intent(
+                hypothesis=task[:200],
+                action=f"{agent_type}@{target}",
+                priority=priority.value,
+                max_steps=sub.max_iterations,
+                expiry_s=float(sub.ttl),
+            )
         if intent_id:
             self.frontier.claim(intent_id)
             _intent_holder["id"] = intent_id

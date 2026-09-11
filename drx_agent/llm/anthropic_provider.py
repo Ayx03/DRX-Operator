@@ -151,7 +151,11 @@ class AnthropicProvider(LLMProvider):
         self.config = config
         try:
             import anthropic
-            self.client = anthropic.AsyncAnthropic(api_key=config.api_key)
+            self.client = anthropic.AsyncAnthropic(
+                api_key=config.api_key,
+                timeout=120.0,
+                max_retries=0,
+            )
         except ImportError:
             raise LLMError("anthropic package not installed. Run: pip install anthropic")
 

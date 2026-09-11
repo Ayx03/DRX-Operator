@@ -20,7 +20,11 @@ class OpenAIProvider(LLMProvider):
         self.config = config
         try:
             from openai import AsyncOpenAI
-            kwargs = {"api_key": config.api_key}
+            kwargs = {
+                "api_key": config.api_key,
+                "timeout": 120.0,
+                "max_retries": 0,
+            }
             if config.base_url:
                 kwargs["base_url"] = config.base_url
             self.client = AsyncOpenAI(**kwargs)
