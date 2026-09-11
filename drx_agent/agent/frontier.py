@@ -10,6 +10,7 @@ through the enabled_by reverse index to kill dependent intents.
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -65,6 +66,7 @@ class DeadEnd:
     intent_id: str
     hypothesis: str
     reason: str
+    category: str = "unknown"
     ts: float = field(default_factory=time.time)
 
 
@@ -165,17 +167,23 @@ class Frontier:
         )
         return True
 
-    def kill(self, intent_id: str, reason: str) -> bool:
+    def kill(self, intent_id: str, reason: str, category: str = "unknown") -> bool:
         intent = self._intents.get(intent_id)
         if intent is None or intent.status not in (IntentStatus.OPEN, IntentStatus.CLAIMED):
             return False
         intent.status = IntentStatus.DEAD
         intent.result = (reason or "")[:200]
         intent.resolved_by = self._append_event(
-            "intent.killed", {"intent_id": intent_id, "reason": intent.result}
+            "intent.killed",
+            {"intent_id": intent_id, "reason": intent.result, "category": category},
         )
         self._dead_ends.append(
-            DeadEnd(intent_id=intent_id, hypothesis=intent.hypothesis, reason=intent.result)
+            DeadEnd(
+                intent_id=intent_id,
+                hypothesis=intent.hypothesis,
+                reason=intent.result,
+                category=category,
+            )
         )
         if len(self._dead_ends) > MAX_DEAD_ENDS:
             del self._dead_ends[: len(self._dead_ends) - MAX_DEAD_ENDS]
@@ -269,6 +277,52 @@ class Frontier:
     def dead_ends(self) -> list[DeadEnd]:
         return list(self._dead_ends)
 
+    @staticmethod
+    def _tokens(text: str) -> set:
+        """词元 + 中文二元组（中文改写用 bigram 比单字 Jaccard 稳）。"""
+        t = (text or "").lower()
+        norm = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", t)
+        grams = {norm[i:i + 2] for i in range(len(norm) - 1)} if len(norm) >= 2 else {norm}
+        words = set(re.findall(r"[a-z0-9_]+", t))
+        return grams | words
+
+    def find_similar_dead_end(self, hypothesis: str, threshold: float = 0.4):
+        """重叠系数找已排除的同类方向（防换个说法重试死路）。"""
+        h = self._tokens(hypothesis)
+        if not h:
+            return None
+        best, best_sim = None, 0.0
+        for d in self._dead_ends:
+            t = self._tokens(d.hypothesis)
+            if not t:
+                continue
+            sim = len(h & t) / min(len(h), len(t))
+            if sim > best_sim:
+                best, best_sim = d, sim
+        return best if best is not None and best_sim >= threshold else None
+
+    def score_intent(self, intent: "Intent") -> float:
+        """启发式价值分：优先级 + 证据支撑 - 成本 - 与其他 open 意图的冗余。"""
+        score = float(5 - int(intent.priority))
+        if intent.depends_on:
+            score += 2.0
+        score -= 0.5 * intent.budget.steps_used
+        h = self._tokens(intent.hypothesis)
+        for other in self._intents.values():
+            if other.id == intent.id or other.status is not IntentStatus.OPEN:
+                continue
+            o = self._tokens(other.hypothesis)
+            denom = min(len(h), len(o))
+            if denom and (len(h & o) / denom) >= 0.5:
+                score -= 1.5
+        return score
+
+    def ranked_open(self, limit=None) -> list:
+        """按价值分排序的 open 意图（Judge 决策与批量派发用）。"""
+        items = [i for i in self._intents.values() if i.status is IntentStatus.OPEN]
+        items.sort(key=lambda i: (-self.score_intent(i), i.budget.created_ts))
+        return items[:limit] if limit else items
+
     def history(self) -> list[dict]:
         return list(self._history)
 
@@ -334,7 +388,7 @@ class Frontier:
             ],
             "dead_ends": [
                 {"intent_id": d.intent_id, "hypothesis": d.hypothesis,
-                 "reason": d.reason, "ts": d.ts}
+                 "reason": d.reason, "category": d.category, "ts": d.ts}
                 for d in self._dead_ends
             ],
             "enabled_by": self._enabled_by,
@@ -379,6 +433,7 @@ class Frontier:
                         intent_id=raw["intent_id"],
                         hypothesis=raw.get("hypothesis", ""),
                         reason=raw.get("reason", ""),
+                        category=raw.get("category", "unknown"),
                         ts=float(raw.get("ts", 0.0) or 0.0),
                     )
                 )

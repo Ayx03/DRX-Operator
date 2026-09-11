@@ -70,6 +70,7 @@ JUDGE_SYSTEM_PROMPT = """你在 Fact-Intent 图上做面向目标的判断，不
 - 已有事实可据分化时，各 intent 覆盖不同维度、不重叠。
 - 方向失效用 intent_kill 并写明原因（为什么走不通）。
 - 汇总/报告类意图放最后：仅当没有其他实质探索方向在途或待开时才开。
+- intent_kill 必须给 category 归因：strategy(方向本身错)/execution(命令或工具失败)/prerequisite(缺前置条件)/policy(被策略拦截)/environment(目标不可达)/timeout。只有 strategy 失败才需要换方向重规划；其他类别应先补前置条件或换执行方式，而不是放弃方向。
 - 你**不能执行任何攻击动作**（没有 shell/http/文件工具）——只做图决策。
 """
 
@@ -655,12 +656,20 @@ class MasterAgent:
                 "type": "function",
                 "function": {
                     "name": "intent_kill",
-                    "description": "意图走不通，标记为死路并记录原因（禁止重复尝试）。",
+                    "description": (
+                        "意图走不通，标记为死路并记录原因与归因类别（禁止重复尝试）。"
+                        "category: strategy/execution/prerequisite/policy/environment/timeout。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "intent_id": {"type": "string"},
                             "reason": {"type": "string", "description": "为什么走不通"},
+                            "category": {
+                                "type": "string",
+                                "enum": ["strategy", "execution", "prerequisite", "policy", "environment", "timeout"],
+                                "description": "失败归因类别",
+                            },
                         },
                         "required": ["intent_id", "reason"],
                     },
@@ -2311,8 +2320,21 @@ class MasterAgent:
         return json.dumps(self.blackboard.to_dict(), ensure_ascii=False)
 
     def _tool_intent_add(self, args: dict) -> str:
+        hypothesis = str(args.get("hypothesis", ""))
+        similar = self.frontier.find_similar_dead_end(hypothesis)
+        if similar is not None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        f"与已排除方向高度相似，禁止重复：[{similar.category}] "
+                        f"{similar.hypothesis[:80]} — {similar.reason[:80]}。请换方向。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
         iid = self.frontier.add_intent(
-            hypothesis=str(args.get("hypothesis", "")),
+            hypothesis=hypothesis,
             action=str(args.get("action", "")),
             priority=int(args.get("priority", 3) or 3),
             max_steps=int(args.get("max_steps", 8) or 8),
@@ -2353,12 +2375,18 @@ class MasterAgent:
         facts_block = "\n".join(findings) or "(暂无已确认事实)"
         dead = self.frontier.dead_ends()[-8:]
         dead_block = "\n".join(
-            f"- {d.hypothesis} — {d.reason}" for d in dead
+            f"- [{d.category}] {d.hypothesis} — {d.reason}" for d in dead
+        ) or "(无)"
+        ranked = self.frontier.ranked_open(5)
+        ranked_block = "\n".join(
+            f"- [{i.id}] 价值分 {self.frontier.score_intent(i):.1f} | {i.hypothesis}"
+            for i in ranked
         ) or "(无)"
         return (
             "【已确认事实 Facts】\n" + facts_block + "\n\n"
             + self.frontier.view(2000) + "\n\n"
-            + "【已排除方向 DeadEnds（禁止重复）】\n" + dead_block
+            + "【待探索意图（价值分高者优先执行）】\n" + ranked_block + "\n\n"
+            + "【已排除方向 DeadEnds（禁止重复；[类别]=失败归因）】\n" + dead_block
         )
 
     async def run_judge_turn(self, context: str = "") -> str:
@@ -2488,12 +2516,30 @@ class MasterAgent:
             self._set_current_intent(None)
         return json.dumps({"ok": ok}, ensure_ascii=False)
 
+    @staticmethod
+    def _classify_failure(reason: str) -> str:
+        """Reviewer 失败归因：strategy/execution/prerequisite/policy/environment/timeout。"""
+        r = (reason or "").lower()
+        if any(k in r for k in ("超时", "timeout", "timed out")):
+            return "timeout"
+        if any(k in r for k in ("权限", "拒绝", "denied", "blocked", "policy", "禁止")):
+            return "policy"
+        if any(k in r for k in ("不可达", "连接", "connection", "unreachable", "网络", "不存在", "not found")):
+            return "environment"
+        if any(k in r for k in ("缺少", "需要先", "前置", "依赖", "prerequisite")):
+            return "prerequisite"
+        if any(k in r for k in ("报错", "error", "exit", "failed", "失败")):
+            return "execution"
+        return "strategy"
+
     def _tool_intent_kill(self, args: dict) -> str:
         iid = str(args.get("intent_id", ""))
-        ok = self.frontier.kill(iid, str(args.get("reason", "")))
+        reason = str(args.get("reason", ""))
+        category = str(args.get("category") or "") or self._classify_failure(reason)
+        ok = self.frontier.kill(iid, reason, category)
         if ok and self._current_intent_id == iid:
             self._set_current_intent(None)
-        return json.dumps({"ok": ok}, ensure_ascii=False)
+        return json.dumps({"ok": ok, "category": category}, ensure_ascii=False)
 
     async def _tool_dispatch_sub_agent(self, args: dict) -> str:
         agent_type = args.get("agent_type", "recon")
