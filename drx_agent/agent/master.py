@@ -2466,6 +2466,58 @@ class MasterAgent:
                 logger.exception("Judge tool %s failed", call["name"])
         return "".join(text_parts).strip()
 
+    def _build_context_pack(self, intent_id: str, scope: str | None = None) -> str:
+        """执行上下文包：从图里提取最小充分信息给 Worker，而不是塞全文。"""
+        intent = self.frontier.by_id(intent_id)
+        if intent is None:
+            return ""
+        lines: list = []
+
+        lines.append(
+            f"【当前意图】{intent.hypothesis}\n执行方向：{intent.action}\n"
+            f"预算：{intent.budget.steps_used}/{intent.budget.max_steps} 步"
+        )
+
+        refs = self.frontier.supporting_refs(intent_id, scope=scope)
+        fact_lines: list = []
+        for ref in refs[:10]:
+            if "::" in ref:
+                host, claim = ref.split("::", 1)
+                resolved = self._kb_claim_text(host, claim)
+                fact_lines.append(f"- [Fact] {host}: {resolved or claim}")
+            else:
+                fact_lines.append(f"- {ref}")
+        if fact_lines:
+            lines.append("【支撑事实】\n" + "\n".join(fact_lines))
+
+        similar = self.frontier.find_similar_dead_end(intent.hypothesis)
+        dead = self.frontier.dead_ends()[-5:]
+        dead_lines: list = []
+        if similar is not None:
+            dead_lines.append(
+                f"- ⚠ 本意图与已排除方向相似：[{similar.category}] "
+                f"{similar.hypothesis[:80]} — {similar.reason[:80]}（避免重复）"
+            )
+        for d in dead:
+            dead_lines.append(f"- [{d.category}] {d.hypothesis[:80]} — {d.reason[:80]}")
+        if dead_lines:
+            lines.append("【已排除方向（禁止重复）】\n" + "\n".join(dead_lines[:6]))
+
+        siblings = [
+            i for i in self.frontier.ranked_open(6)
+            if i.id != intent_id
+            and (not scope or scope in i.hypothesis or scope in i.action)
+        ]
+        if siblings:
+            lines.append(
+                "【并行中的其他意图（避免重复工作）】\n"
+                + "\n".join(f"- {i.hypothesis[:80]}" for i in siblings[:4])
+            )
+
+        lines.append(f"【约束】模式={self.mode}；只依据证据判断，不臆造。")
+        text = "\n\n".join(lines)
+        return text[:4000]
+
     def _focused_context(self, intent_id: str, scope: str | None = None) -> str:
         refs = self.frontier.supporting_refs(intent_id, scope=scope)
         lines: list[str] = []
@@ -2632,10 +2684,11 @@ class MasterAgent:
                 self.frontier.tick(iid, 1)
             return res
 
-        if target != "frontier-batch":
-            ctx = self._focused_context(intent.id, scope=target)
-            if ctx:
-                sub_system += "\n\n" + ctx
+        ctx = self._build_context_pack(
+            intent.id, scope=None if target == "frontier-batch" else target
+        )
+        if ctx:
+            sub_system += "\n\n" + ctx
         return SubAgent(
             agent_type=agent_type,
             target=target,
@@ -4005,7 +4058,7 @@ class MasterAgent:
             self.frontier.claim(intent_id)
             _intent_holder["id"] = intent_id
             self._intent_agent_map[intent_id] = sub.agent_id
-            ctx = self._focused_context(intent_id, scope=None)
+            ctx = self._build_context_pack(intent_id, scope=None)
             if ctx:
                 sub.system_prompt = sub.system_prompt + "\n\n" + ctx
 
@@ -5388,7 +5441,7 @@ class MasterAgent:
             self.frontier.claim(intent_id)
             _intent_holder["id"] = intent_id
             self._intent_agent_map[intent_id] = sub.agent_id
-            ctx = self._focused_context(intent_id, scope=target)
+            ctx = self._build_context_pack(intent_id, scope=target)
             if ctx:
                 sub.system_prompt = sub.system_prompt + "\n\n" + ctx
 
