@@ -317,6 +317,30 @@ class Frontier:
                 score -= 1.5
         return score
 
+    def prune_dominated(self, threshold: float = 0.7) -> int:
+        """支配剪枝：同类（高重叠）open 意图只保留价值分最高的，其余记为死路。"""
+        removed = 0
+        kept: list = []
+        for intent in self.ranked_open():
+            h = self._tokens(intent.hypothesis)
+            dominated_by = None
+            for better in kept:
+                b = self._tokens(better.hypothesis)
+                denom = min(len(h), len(b))
+                if denom and (len(h & b) / denom) >= threshold:
+                    dominated_by = better
+                    break
+            if dominated_by is not None:
+                self.kill(
+                    intent.id,
+                    f"被更优意图支配：{dominated_by.hypothesis[:60]}",
+                    "dominated",
+                )
+                removed += 1
+            else:
+                kept.append(intent)
+        return removed
+
     def ranked_open(self, limit=None) -> list:
         """按价值分排序的 open 意图（Judge 决策与批量派发用）。"""
         items = [i for i in self._intents.values() if i.status is IntentStatus.OPEN]

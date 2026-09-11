@@ -2424,6 +2424,7 @@ class MasterAgent:
         """
         if self.llm_provider is None:
             return ""
+        self.frontier.prune_dominated()
         graph = self._judge_graph_view()
         user_content = (context + "\n\n" if context else "") + graph
         messages = [
