@@ -71,12 +71,34 @@ def _build_one_provider(spec: dict):
         return None
 
 
+def _config_path() -> str:
+    """Resolve the config file path across run modes (frozen binary / dev).
+
+    Priority: $DRX_CONFIG → ~/.config/drx-operator/default_config.json →
+    <executable-dir>/configs/default_config.json (frozen) → package-relative.
+    """
+    env = os.environ.get("DRX_CONFIG")
+    if env:
+        return os.path.abspath(env)
+    user_cfg = os.path.join(
+        os.path.expanduser("~"), ".config", "drx-operator", "default_config.json"
+    )
+    if os.path.isfile(user_cfg):
+        return user_cfg
+    if getattr(sys, "frozen", False):
+        adjacent = os.path.join(
+            os.path.dirname(sys.executable), "configs", "default_config.json"
+        )
+        if os.path.isfile(adjacent):
+            return adjacent
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "configs", "default_config.json")
+    )
+
+
 def _build_llm_provider(event_bus=None):
     
-    cfg_path = os.path.join(
-        os.path.dirname(__file__), "..", "configs", "default_config.json"
-    )
-    cfg_path = os.path.abspath(cfg_path)
+    cfg_path = _config_path()
     if not os.path.isfile(cfg_path):
         logger.warning("LLM config not found at %s", cfg_path)
         return None
@@ -144,6 +166,8 @@ class DrxAgent:
         "diff", "comm", "join", "column", "fold", "fmt", "rev", "expand",
         "find", "locate", "which", "whereis", "type",
         "base64", "base32", "md5sum", "sha1sum", "sha256sum", "sha512sum",
+        "r2", "radare2", "objdump", "readelf", "nm", "gdb", "ltrace", "strace",
+        "patchelf", "checksec", "rabin2", "r2pipe", "xxd", "hexdump", "od",
         "shasum", "cksum", "uuencode", "uudecode",
         "curl", "wget", "dig", "host", "nslookup", "whois",
         "ping", "ping6", "traceroute", "traceroute6", "tracepath",
@@ -179,9 +203,7 @@ class DrxAgent:
         # Config overrides: bash.whitelist null → everything allowed; [...] → exact list; extra_whitelist → append.
         bash_whitelist = list(self.BASH_WHITELIST)
         try:
-            cfg_path = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "..", "configs", "default_config.json")
-            )
+            cfg_path = _config_path()
             with open(cfg_path, "r", encoding="utf-8") as fp:
                 cfg = json.load(fp)
             bash_cfg = cfg.get("bash") or {}
@@ -204,9 +226,7 @@ class DrxAgent:
 
         self.llm_provider = _build_llm_provider(event_bus=self.event_bus)
 
-        cfg_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "configs", "default_config.json")
-        )
+        cfg_path = _config_path()
         self.mcp_manager = MCPManager.from_config_file(cfg_path)
 
         self.hooks = HookManager()
