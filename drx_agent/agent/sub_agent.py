@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -61,6 +62,7 @@ class SubAgent:
         usage_callback: Optional[Callable[[Optional[dict], Optional[str]], None]] = None,
         llm_call_timeout: float = 600.0,
         notification_provider: Optional[Callable[[], str]] = None,
+        stop_on_pattern: Optional[re.Pattern] = None,
     ) -> None:
         self.agent_id = f"{agent_type}-{uuid.uuid4().hex[:4]}"
         self.agent_type = agent_type
@@ -77,6 +79,7 @@ class SubAgent:
         self.usage_callback = usage_callback
         self.llm_call_timeout = llm_call_timeout
         self.notification_provider = notification_provider
+        self.stop_on_pattern = stop_on_pattern
         self.status = SubAgentStatus.QUEUED
         self._interrupt = False
 
@@ -254,7 +257,22 @@ class SubAgent:
                     ],
                 }
             messages.append(assistant_msg)
+            tool_start = len(messages)
             scripts_executed += await self._run_tool_calls(pending_calls, messages)
+
+            if self.stop_on_pattern is not None:
+                tool_texts = [
+                    str(m.get("content") or "")
+                    for m in messages[tool_start:]
+                    if m.get("role") == "tool"
+                ]
+                combined = text_now + "\n" + "\n".join(tool_texts)
+                match = self.stop_on_pattern.search(combined)
+                if match:
+                    token = match.group(0)
+                    if token not in final_text:
+                        final_text = f"{final_text}\n{token}".strip()
+                    break
 
         return scripts_executed, final_text, error_seen
 
