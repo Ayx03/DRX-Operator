@@ -18,6 +18,9 @@ from enum import Enum
 from typing import Callable
 
 MAX_INTENTS = 60
+# 仅"方向本身错"参与死路拦截；execution/environment/prerequisite/policy/
+# timeout/resource/dominated/expired 属可恢复或非方向性失败，不拦重试。
+_BLOCKING_CATEGORIES = ("strategy",)
 MAX_DEAD_ENDS = 40
 HISTORY_CAP = 500
 
@@ -218,7 +221,7 @@ class Frontier:
             return None
         intent.budget.steps_used += steps
         if intent.exhausted():
-            self.kill(intent_id, "budget exhausted")
+            self.kill(intent_id, "budget exhausted", "resource")
             return IntentStatus.DEAD
         return intent.status
 
@@ -286,13 +289,15 @@ class Frontier:
         words = set(re.findall(r"[a-z0-9_]+", t))
         return grams | words
 
-    def find_similar_dead_end(self, hypothesis: str, threshold: float = 0.4):
-        """重叠系数找已排除的同类方向（防换个说法重试死路）。"""
+    def find_similar_dead_end(self, hypothesis: str, threshold: float = 0.5):
+        """重叠系数找已排除的同类方向（仅 strategy 类失败参与拦截）。"""
         h = self._tokens(hypothesis)
         if not h:
             return None
         best, best_sim = None, 0.0
         for d in self._dead_ends:
+            if d.category not in _BLOCKING_CATEGORIES:
+                continue
             t = self._tokens(d.hypothesis)
             if not t:
                 continue

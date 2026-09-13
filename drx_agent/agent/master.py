@@ -48,8 +48,7 @@ STUCK_TICK_THRESHOLD = 6
 
 # ---- Judge 层（纯判断，不执行）：对齐 Cairn "在图上做判断，不做任何执行" ----
 _JUDGE_TOOL_NAMES = (
-    "intent_add", "intent_kill", "intent_done", "intent_list",
-    "blackboard_write", "blackboard_read", "list_findings",
+    "intent_add", "intent_kill", "intent_done", "blackboard_write",
     "record_finding", "update_finding_status", "update_target",
 )
 
@@ -2365,7 +2364,7 @@ class MasterAgent:
             hypothesis=hypothesis,
             action=str(args.get("action", "")),
             priority=int(args.get("priority", 3) or 3),
-            max_steps=int(args.get("max_steps", 8) or 8),
+            max_steps=int(args.get("max_steps", 20) or 20),
             expiry_s=float(args.get("expiry_s", 900.0) or 900.0),
             depends_on=tuple(args.get("depends_on") or ()),
             evidence=tuple(args.get("evidence") or ()),
@@ -2609,6 +2608,8 @@ class MasterAgent:
             return "environment"
         if any(k in r for k in ("缺少", "需要先", "前置", "依赖", "prerequisite")):
             return "prerequisite"
+        if any(k in r for k in ("budget", "exhausted", "预算", "额度")):
+            return "resource"
         if any(k in r for k in ("报错", "error", "exit", "failed", "失败")):
             return "execution"
         return "strategy"
