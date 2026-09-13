@@ -597,7 +597,7 @@ class MasterAgent:
                             "hypothesis": {"type": "string", "description": "想验证的断言"},
                             "action": {"type": "string", "description": "计划怎么验证"},
                             "priority": {"type": "integer", "description": "1-5，1 最高，默认 3"},
-                            "max_steps": {"type": "integer", "description": "预算步数，默认 8"},
+                            "max_steps": {"type": "integer", "description": "预算步数，默认 50"},
                             "expiry_s": {"type": "number", "description": "过期秒数，默认 900"},
                             "depends_on": {
                                 "type": "array",
@@ -2364,7 +2364,7 @@ class MasterAgent:
             hypothesis=hypothesis,
             action=str(args.get("action", "")),
             priority=int(args.get("priority", 3) or 3),
-            max_steps=int(args.get("max_steps", 20) or 20),
+            max_steps=int(args.get("max_steps", 50) or 50),
             expiry_s=float(args.get("expiry_s", 900.0) or 900.0),
             depends_on=tuple(args.get("depends_on") or ()),
             evidence=tuple(args.get("evidence") or ()),

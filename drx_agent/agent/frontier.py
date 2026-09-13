@@ -36,7 +36,7 @@ class IntentStatus(str, Enum):
 class IntentBudget:
     """Mutable counters — budget is consumed as the intent runs."""
 
-    max_steps: int = 8
+    max_steps: int = 50
     expiry_s: float = 900.0
     created_ts: float = field(default_factory=time.time)
     steps_used: int = 0
@@ -96,7 +96,7 @@ class Frontier:
         action: str,
         *,
         priority: int = 3,
-        max_steps: int = 8,
+        max_steps: int = 50,
         expiry_s: float = 900.0,
         depends_on: tuple[str, ...] = (),
         evidence: tuple[str, ...] = (),
