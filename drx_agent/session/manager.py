@@ -11,7 +11,8 @@ class SessionManager:
 
     def save(self, kb, messages, active_targets, name="", phase="",
              todos=None, mode="", session_usage=None, frontier=None,
-             handoff=None, stage=None) -> str:
+             handoff=None, stage=None, forum=None, claims=None,
+             moderator=None) -> str:
         session_id = str(uuid.uuid4())[:12]
         self.store.save_session(
             session_id=session_id,
@@ -27,6 +28,9 @@ class SessionManager:
                 "frontier": frontier or {},
                 "handoff": handoff or {},
                 "stage": stage or {},
+                "forum": forum or {},
+                "claims": claims or {},
+                "moderator": moderator or {},
             },
         )
         return session_id
@@ -49,6 +53,9 @@ class SessionManager:
             "frontier": extra.get("frontier", {}),
             "handoff": extra.get("handoff", {}),
             "stage": extra.get("stage", {}),
+            "forum": extra.get("forum", {}),
+            "claims": extra.get("claims", {}),
+            "moderator": extra.get("moderator", {}),
         }
 
     def checkpoint(self, kb, phase, messages, active_targets) -> str:

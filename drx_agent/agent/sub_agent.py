@@ -60,6 +60,7 @@ class SubAgent:
         parallel_tool_calls: bool = True,
         usage_callback: Optional[Callable[[Optional[dict], Optional[str]], None]] = None,
         llm_call_timeout: float = 600.0,
+        notification_provider: Optional[Callable[[], str]] = None,
     ) -> None:
         self.agent_id = f"{agent_type}-{uuid.uuid4().hex[:4]}"
         self.agent_type = agent_type
@@ -75,6 +76,7 @@ class SubAgent:
         self.parallel_tool_calls = parallel_tool_calls
         self.usage_callback = usage_callback
         self.llm_call_timeout = llm_call_timeout
+        self.notification_provider = notification_provider
         self.status = SubAgentStatus.QUEUED
         self._interrupt = False
 
@@ -154,6 +156,17 @@ class SubAgent:
                 self.status = SubAgentStatus.TIMEOUT
                 error_seen = f"ttl ({self.ttl}s) exceeded"
                 break
+
+            if self.notification_provider is not None:
+                try:
+                    note = self.notification_provider() or ""
+                except Exception:
+                    logger.exception("Sub-agent %s notification_provider failed", self.agent_id)
+                    note = ""
+                if note:
+                    messages.append(
+                        {"role": "user", "content": "<新论坛通知>\n" + note[:2000]}
+                    )
 
             text_parts: list[str] = []
             pending_calls: list[dict] = []

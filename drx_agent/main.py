@@ -341,6 +341,15 @@ class DrxAgent:
                         else None
                     ),
                     stage=getattr(self.master, 'stage_machine', StageMachine()).to_dict(),
+                    forum=getattr(self.master, 'forum', None).to_dict()
+                    if getattr(self.master, 'forum', None) is not None
+                    else None,
+                    claims=getattr(self.master, 'claims', None).to_dict()
+                    if getattr(self.master, 'claims', None) is not None
+                    else None,
+                    moderator=getattr(self.master, 'moderator', None).to_dict()
+                    if getattr(self.master, 'moderator', None) is not None
+                    else None,
                 )
                 self.event_bus.publish(Event(
                     type=EventType.AGENT_MESSAGE,
@@ -392,6 +401,12 @@ class DrxAgent:
                 self.master.stage_machine = StageMachine.from_dict(
                     restored.get("stage") or {}
                 )
+                from drx_agent.agent.forum import Forum
+                from drx_agent.agent.claims import ClaimRegistry
+                from drx_agent.agent.moderator import Moderator
+                self.master.forum = Forum.from_dict(restored.get("forum") or {})
+                self.master.claims = ClaimRegistry.from_dict(restored.get("claims") or {})
+                self.master.moderator = Moderator.from_dict(restored.get("moderator") or {})
                 self.master.mode = restored.get("mode", "act") or "act"
                 if restored.get("session_usage"):
                     self.master.session_usage.update(restored["session_usage"])

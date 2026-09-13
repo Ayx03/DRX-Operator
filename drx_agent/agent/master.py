@@ -26,6 +26,10 @@ from drx_agent.agent.sub_agent import SubAgent, SubAgentResult, SubAgentStatus
 from drx_agent.agent.frontier import Frontier
 from drx_agent.agent.handoff import Handoff
 from drx_agent.agent.stage import StageMachine
+from drx_agent.agent.forum import Forum
+from drx_agent.agent.claims import ClaimRegistry
+from drx_agent.agent.moderator import Moderator
+from drx_agent.agent.consensus import Decision, TerminationController
 from drx_agent.agent.task_scheduler import TaskPriority, TaskScheduler
 from drx_agent.engine.bash_sandbox import BashSandbox, BLOCKED_PATTERNS
 from drx_agent.engine.python_sandbox import PythonSandbox, SandboxResult
@@ -253,6 +257,12 @@ class MasterAgent:
         self.frontier: Frontier = Frontier()
         self.handoff: Handoff | None = None
         self.stage_machine: StageMachine = StageMachine()
+        self.forum: Forum = Forum()
+        self.claims: ClaimRegistry = ClaimRegistry()
+        self.moderator: Moderator = Moderator()
+        self.termination: TerminationController = TerminationController()
+        self._forum_cursor: int = 0
+        self._last_moderator_render: str = ""
         self._intent_agent_map: dict[str, str] = {}
         self.frontier.on_invalidate = self._on_frontier_invalidate
         self._current_intent_id: str | None = None
@@ -667,6 +677,8 @@ class MasterAgent:
             f"{self.blackboard.render(2000)}\n"
             "\n"
             f"{self.stage_machine.render()}\n"
+            "\n"
+            f"{self._collaboration_block()}\n"
             "\n"
             "高危操作（漏洞利用/横向移动/破坏性）需用户审批，先告知再执行。"
             + memory_block
@@ -1683,6 +1695,183 @@ class MasterAgent:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_post",
+                    "description": (
+                        "向协作论坛发布一条类型化消息。content 是正文；msg_type 取 "
+                        "claim/question/evidence/candidate/correction/work_offer/"
+                        "work_claim/help/status；epistemic_status 取 raw/hypothesis/"
+                        "observed/verified/rejected。to 为空表示按 topic 公开（非广播），"
+                        "announcement=true 或 correction/evidence 且 to 为空才视为全体可见。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "消息正文"},
+                            "msg_type": {"type": "string", "description": "消息类型，默认 claim"},
+                            "epistemic_status": {"type": "string", "description": "认知状态，默认 hypothesis"},
+                            "topic": {"type": "string", "description": "主题标签"},
+                            "to": {"type": "string", "description": "定向接收者 agent_id，空=公开"},
+                            "reply_to": {"type": "integer", "description": "回复的消息 id（根消息）"},
+                            "scope": {"type": "string", "description": "作用域标签"},
+                            "references": {"type": "array", "items": {"type": "string"}, "description": "引用的 E-xxxx/intent id"},
+                            "ttl": {"type": "number", "description": "过期秒数，0=永不过期"},
+                            "announcement": {"type": "boolean", "description": "是否公告（全体可见）"},
+                        },
+                        "required": ["content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_read",
+                    "description": "分页读取论坛。thread_id=0 读最近根消息，否则读该线程全部消息。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "thread_id": {"type": "integer", "description": "线程 id，0=根消息列表"},
+                            "limit": {"type": "integer", "description": "每页条数，默认 20"},
+                            "offset": {"type": "integer", "description": "分页起始，默认 0"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_threads",
+                    "description": "列出论坛线程（根消息），含 reply_count/last_at，置顶优先。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "stage": {"type": "string", "description": "按阶段过滤，空=全部"},
+                            "limit": {"type": "integer", "description": "最多返回线程数，默认 50"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_digest",
+                    "description": "论坛主题索引（仅计数，非事实）。读原文用 forum_read。",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_wait",
+                    "description": "轮询（非阻塞）发给 master 或公告的新消息。after_id 之后的消息。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "after_id": {"type": "integer", "description": "只看 id 大于此值的消息"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_pin",
+                    "description": "置顶/取消置顶一条消息所在线程（最多 3 条置顶）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "integer", "description": "消息 id"},
+                            "pinned": {"type": "boolean", "description": "默认 true=置顶"},
+                        },
+                        "required": ["message_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_close",
+                    "description": "关闭一条消息所在线程：拒绝回复但保留历史。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "integer", "description": "消息 id"},
+                            "reason": {"type": "string", "description": "关闭原因"},
+                        },
+                        "required": ["message_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "claim_acquire",
+                    "description": "认领一个工作项（租约）。已被认领则返回错误，避免两个 worker 抢同一项。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "work_item": {"type": "string", "description": "工作项标识"},
+                            "ttl": {"type": "number", "description": "租约秒数，默认 600"},
+                        },
+                        "required": ["work_item"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "claim_release",
+                    "description": "释放一个认领，让其他 worker 可以接管。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "claim_id": {"type": "string", "description": "claim_acquire 返回的 claim_id"},
+                        },
+                        "required": ["claim_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "claim_status",
+                    "description": "查看认领状态：给 work_item 查归属，否则列出所有活跃认领。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "work_item": {"type": "string", "description": "工作项，省略则列出活跃认领"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "team_status",
+                    "description": "团队协作状态：终止裁决 + 覆盖率 + 待验证数 + 共识度 + 调度建议。",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "request_close",
+                    "description": "请求收束：程序层 TerminationController 裁决是否满足终止条件。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {"type": "string", "description": "请求收束的理由（参考）"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
         ] + self.mcp.openai_tool_schemas()
 
 
@@ -1855,6 +2044,16 @@ class MasterAgent:
                 f"section={args.get('section', '*')} "
                 f"item={args.get('item_id', '*')}"
             )
+        elif name == "forum_post":
+            preview = f"{args.get('msg_type', 'claim')} ({len(str(args.get('content', '')))} chars)"
+        elif name == "forum_read":
+            preview = f"thread={args.get('thread_id', 0)}"
+        elif name == "claim_acquire":
+            preview = f"work_item={args.get('work_item', '?')}"
+        elif name == "claim_status":
+            preview = f"work_item={args.get('work_item', '*')}"
+        elif name in ("team_status", "request_close", "forum_digest", "forum_wait"):
+            preview = name
         elif name == "parse_nmap":
             preview = f"{len(args.get('output', ''))} chars of nmap output"
         elif name == "parse_http":
@@ -2077,6 +2276,30 @@ class MasterAgent:
                 result_text = self._tool_blackboard_read(args)
             elif name == "read_handoff":
                 result_text = self._tool_read_handoff(args)
+            elif name == "forum_post":
+                result_text = self._tool_forum_post(args)
+            elif name == "forum_read":
+                result_text = self._tool_forum_read(args)
+            elif name == "forum_threads":
+                result_text = self._tool_forum_threads(args)
+            elif name == "forum_digest":
+                result_text = self._tool_forum_digest(args)
+            elif name == "forum_wait":
+                result_text = self._tool_forum_wait(args)
+            elif name == "forum_pin":
+                result_text = self._tool_forum_pin(args)
+            elif name == "forum_close":
+                result_text = self._tool_forum_close(args)
+            elif name == "claim_acquire":
+                result_text = self._tool_claim_acquire(args)
+            elif name == "claim_release":
+                result_text = self._tool_claim_release(args)
+            elif name == "claim_status":
+                result_text = self._tool_claim_status(args)
+            elif name == "team_status":
+                result_text = self._tool_team_status(args)
+            elif name == "request_close":
+                result_text = self._tool_request_close(args)
             elif name == "stage_advance":
                 result_text = self._tool_stage_advance(args)
             elif name == "intent_add":
@@ -2922,6 +3145,191 @@ class MasterAgent:
             ensure_ascii=False,
         )
 
+    # ------------------------------------------------------ collaboration tools
+
+    def _tool_forum_post(self, args: dict) -> str:
+        content = str(args.get("content", "") or "")
+        refs = args.get("references") or ()
+        if isinstance(refs, str):
+            refs = (refs,)
+        mid = self.forum.post(
+            "master",
+            content,
+            msg_type=str(args.get("msg_type", "claim") or "claim"),
+            epistemic_status=str(args.get("epistemic_status", "hypothesis") or "hypothesis"),
+            topic=str(args.get("topic", "") or ""),
+            to=str(args.get("to", "") or ""),
+            reply_to=int(args.get("reply_to", 0) or 0),
+            scope=str(args.get("scope", "") or ""),
+            references=tuple(refs),
+            ttl=float(args.get("ttl", 0.0) or 0.0),
+            stage=self.stage_machine.stage.value,
+            announcement=bool(args.get("announcement", False)),
+        )
+        if mid is None:
+            return json.dumps(
+                {"ok": False, "error": "empty content or closed/unknown target thread"},
+                ensure_ascii=False,
+            )
+        return json.dumps({"ok": True, "message_id": mid}, ensure_ascii=False)
+
+    def _tool_forum_read(self, args: dict) -> str:
+        msgs = self.forum.read(
+            thread_id=int(args.get("thread_id", 0) or 0),
+            limit=int(args.get("limit", 20) or 20),
+            offset=int(args.get("offset", 0) or 0),
+        )
+        return json.dumps({"ok": True, "messages": msgs}, ensure_ascii=False)
+
+    def _tool_forum_threads(self, args: dict) -> str:
+        threads = self.forum.threads(
+            stage=str(args.get("stage", "") or ""),
+            limit=int(args.get("limit", 50) or 50),
+        )
+        return json.dumps({"ok": True, "threads": threads}, ensure_ascii=False)
+
+    def _tool_forum_digest(self, args: dict) -> str:
+        return json.dumps({"ok": True, "digest": self.forum.digest()}, ensure_ascii=False)
+
+    def _tool_forum_wait(self, args: dict) -> str:
+        after_id = int(args.get("after_id", 0) or 0)
+        msgs = self.forum.wait("master", after_id=after_id)
+        self._forum_cursor = max([self._forum_cursor] + [m["id"] for m in msgs])
+        return json.dumps({"ok": True, "messages": msgs}, ensure_ascii=False)
+
+    def _tool_forum_pin(self, args: dict) -> str:
+        ok = self.forum.pin(
+            int(args.get("message_id", 0) or 0), pinned=bool(args.get("pinned", True))
+        )
+        return json.dumps({"ok": ok}, ensure_ascii=False)
+
+    def _tool_forum_close(self, args: dict) -> str:
+        ok = self.forum.close(
+            int(args.get("message_id", 0) or 0),
+            reason=str(args.get("reason", "") or ""),
+        )
+        return json.dumps({"ok": ok}, ensure_ascii=False)
+
+    def _tool_claim_acquire(self, args: dict) -> str:
+        work_item = str(args.get("work_item", "") or "")
+        if not work_item:
+            return json.dumps({"ok": False, "error": "work_item is required"}, ensure_ascii=False)
+        ttl = float(args.get("ttl", 600.0) or 600.0)
+        owner = self.claims.owner_of(work_item)
+        if owner is not None:
+            return json.dumps({"ok": False, "error": f"已被 {owner} 认领"}, ensure_ascii=False)
+        claim_id = self.claims.acquire(work_item, "master", ttl=ttl)
+        if claim_id is None:
+            return json.dumps({"ok": False, "error": "已被他人认领"}, ensure_ascii=False)
+        return json.dumps({"ok": True, "claim_id": claim_id}, ensure_ascii=False)
+
+    def _tool_claim_release(self, args: dict) -> str:
+        ok = self.claims.release(str(args.get("claim_id", "") or ""))
+        return json.dumps({"ok": ok}, ensure_ascii=False)
+
+    def _tool_claim_status(self, args: dict) -> str:
+        work_item = args.get("work_item")
+        if work_item is not None:
+            owner = self.claims.owner_of(str(work_item))
+            return json.dumps(
+                {"ok": True, "work_item": str(work_item), "owner": owner},
+                ensure_ascii=False,
+            )
+        active = [
+            {
+                "claim_id": c.claim_id,
+                "work_item": c.work_item,
+                "owner": c.owner,
+                "lease_until": c.lease_until,
+            }
+            for c in self.claims.active()
+        ]
+        return json.dumps({"ok": True, "active": active}, ensure_ascii=False)
+
+    def _termination_snapshot(self) -> tuple:
+        coverage: dict = {}
+        metrics = self.moderator.extract_metrics(
+            frontier=self.frontier,
+            claims=self.claims,
+            forum=self.forum,
+            knowledge_base=self.knowledge_base,
+        )
+        findings = [f for _h, f in self.knowledge_base.all_findings()]
+        confirmed = sum(
+            1 for f in findings if getattr(f, "status", "") in ("confirmed", "exploited")
+        )
+        quorum = (confirmed / len(findings)) if findings else 0.0
+        state = self.termination.from_signals(
+            coverage=coverage,
+            pending_verifications=metrics.pending_verifications,
+            quorum=quorum,
+        )
+        decision, reason = self.termination.can_close(state)
+        return decision, reason, coverage, quorum, metrics
+
+    def _tool_team_status(self, args: dict) -> str:
+        try:
+            decision, reason, coverage, quorum, metrics = self._termination_snapshot()
+            suggestions = self.moderator.observe(metrics)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "decision": decision.value,
+                    "reason": reason,
+                    "rendered": self.termination.render(decision, reason),
+                    "coverage": coverage,
+                    "pending_verifications": metrics.pending_verifications,
+                    "quorum": round(quorum, 3),
+                    "active_claims": len(self.claims.active()),
+                    "forum_messages": self.forum.count(),
+                    "moderator_suggestions": [
+                        {
+                            "kind": s.kind,
+                            "severity": s.severity,
+                            "text": s.text,
+                            "target": s.target,
+                        }
+                        for s in suggestions
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            logger.exception("team_status failed")
+            return json.dumps(
+                {"ok": False, "error": f"team_status failed: {exc}"}, ensure_ascii=False
+            )
+
+    def _tool_request_close(self, args: dict) -> str:
+        try:
+            decision, reason, _coverage, _quorum, _metrics = self._termination_snapshot()
+            if decision is Decision.APPROVE:
+                note = f"团队终止条件已满足：{reason}"
+                self.event_bus.publish(
+                    Event(
+                        type=EventType.AGENT_MESSAGE,
+                        data={"text": note, "source": "system"},
+                    )
+                )
+                return json.dumps(
+                    {"ok": True, "decision": decision.value, "reason": reason, "note": note},
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "ok": True,
+                    "decision": decision.value,
+                    "reason": reason,
+                    "instruction": "终止条件尚未满足，请继续工作。",
+                },
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            logger.exception("request_close failed")
+            return json.dumps(
+                {"ok": False, "error": f"request_close failed: {exc}"}, ensure_ascii=False
+            )
+
     def _freeze_all_workers(self) -> None:
         """Cancel every running worker and clear the worker maps on stage change."""
         for iid in list(self._intent_agent_map.keys()):
@@ -3313,6 +3721,8 @@ class MasterAgent:
         )
 
         _intent_holder: dict[str, str] = {"id": intent.id}
+        _agent_id_holder: dict[str, str] = {"id": ""}
+        _notif_cursor: dict[str, int] = {"cursor": 0}
 
         async def _sub_executor(name: str, tool_args: dict) -> str:
             if name != "stage_advance" and not self.stage_machine.is_allowed(name):
@@ -3341,7 +3751,7 @@ class MasterAgent:
         )
         if ctx:
             sub_system += "\n\n" + ctx
-        return SubAgent(
+        sub = SubAgent(
             agent_type=agent_type,
             target=target,
             task=f"{intent.hypothesis} —— {intent.action}",
@@ -3355,6 +3765,35 @@ class MasterAgent:
             parallel_tool_calls=True,
             usage_callback=self._record_usage,
         )
+        # The worker's agent_id exists only after construction, so the forum
+        # view and notification provider are attached post-hoc via mutable
+        # holders captured by the closures.
+        _agent_id_holder["id"] = sub.agent_id
+        sub.system_prompt += "\n\n" + self.forum.render_for(sub.agent_id)
+
+        def _notif_provider() -> str:
+            try:
+                agent_id = _agent_id_holder["id"]
+                msgs = self.forum.wait(
+                    agent_id, after_id=_notif_cursor["cursor"], limit=10
+                )
+                if not msgs:
+                    return ""
+                _notif_cursor["cursor"] = max(m["id"] for m in msgs)
+                lines = []
+                for m in msgs:
+                    tag = m.get("epistemic_status", "")
+                    lines.append(
+                        f"- #{m['id']} <{m['agent_id']}> [{tag}] "
+                        f"{m['content'][:200]}"
+                    )
+                return "【论坛通知】\n" + "\n".join(lines)
+            except Exception:
+                logger.exception("forum notification provider failed")
+                return ""
+
+        sub.notification_provider = _notif_provider
+        return sub
 
     async def _dispatch_frontier_batch(
         self,
@@ -5445,6 +5884,51 @@ class MasterAgent:
             self._chat_active = False
             self._interrupt = False
 
+    def _maybe_tick_moderator(self) -> None:
+        try:
+            if not self.moderator.should_run():
+                return
+            metrics = self.moderator.extract_metrics(
+                frontier=self.frontier,
+                claims=self.claims,
+                forum=self.forum,
+                knowledge_base=self.knowledge_base,
+            )
+            suggestions = self.moderator.tick(metrics)
+            if not suggestions:
+                return
+            rendered = self.moderator.render(suggestions)
+            self._last_moderator_render = rendered
+            if not rendered:
+                return
+            self.messages.append({"role": "user", "content": rendered})
+            self.event_bus.publish(
+                Event(
+                    type=EventType.AGENT_MESSAGE,
+                    data={"text": rendered, "source": "system"},
+                )
+            )
+        except Exception:
+            logger.exception("moderator tick failed")
+
+    def _collaboration_block(self) -> str:
+        try:
+            parts = [self.forum.digest()]
+            active = self.claims.active()
+            if active:
+                lines = [f"- {c.work_item} ← {c.owner}" for c in active[:8]]
+                parts.append("【活跃认领 Claim】\n" + "\n".join(lines))
+            else:
+                parts.append("【活跃认领 Claim】\n(空)")
+            if self._last_moderator_render:
+                parts.append(self._last_moderator_render)
+            text = "\n\n".join(parts)
+            if len(text) > 800:
+                text = text[:799] + "…"
+            return text
+        except Exception:
+            return ""
+
     async def _chat_loop(self, tools, system_prompt) -> None:
         iteration = 0
         next_checkpoint = self.iteration_soft_threshold
@@ -5487,6 +5971,7 @@ class MasterAgent:
                         f"🐜 蜂群并行完成 {len(summary)} 个意图"
                     )
                     continue
+            self._maybe_tick_moderator()
             request_messages = [
                 {"role": "system", "content": system_prompt + "\n\n" + self.frontier.view()},
                 *self.messages,

@@ -33,8 +33,17 @@ class Stage(str, Enum):
 STAGE_ORDER: tuple[Stage, ...] = (Stage.RECON, Stage.RESEARCH, Stage.VERIFY, Stage.SYNTHESIS)
 
 # Always-allowed control tools regardless of stage, so the machine can progress.
+# Collaboration tools (forum/claim/team_status/request_close) are orthogonal to
+# stage capability boundaries: any stage may coordinate with peers without
+# weakening its own tool contract.
 ALWAYS_ALLOWED: frozenset[str] = frozenset(
-    {"todo_write", "blackboard_read", "blackboard_write", "stage_advance"}
+    {
+        "todo_write", "blackboard_read", "blackboard_write", "stage_advance",
+        "forum_post", "forum_read", "forum_threads", "forum_digest",
+        "forum_pin", "forum_close", "forum_wait",
+        "claim_acquire", "claim_release", "claim_status",
+        "team_status", "request_close",
+    }
 )
 
 # The complete working tool set (available to RESEARCH minus handoff_submit /
