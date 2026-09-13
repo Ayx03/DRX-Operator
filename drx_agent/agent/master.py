@@ -29,6 +29,8 @@ from drx_agent.agent.stage import StageMachine
 from drx_agent.agent.forum import Forum
 from drx_agent.agent.claims import ClaimRegistry
 from drx_agent.agent.moderator import Moderator
+from drx_agent.agent.irc import IRC
+from drx_agent.agent.project_note import NOTE_SECTIONS, ProjectNote
 from drx_agent.agent.consensus import Decision, TerminationController
 from drx_agent.agent.task_scheduler import TaskPriority, TaskScheduler
 from drx_agent.engine.bash_sandbox import BashSandbox, BLOCKED_PATTERNS
@@ -53,7 +55,7 @@ DESTROY_CONFIRMATION_PHRASE = "I CONFIRM DESTRUCTIVE ACTION"
 # Observer review with a causal replay of recent history (no auto-kill).
 STUCK_TICK_THRESHOLD = 6
 
-# ---- Judge 层（纯判断，不执行）：对齐 Cairn "在图上做判断，不做任何执行" ----
+# ---- Judge 层（纯判断，不执行）：只在图上做判断，不做任何执行 ----
 _JUDGE_TOOL_NAMES = (
     "intent_add", "intent_kill", "intent_done", "blackboard_write",
     "record_finding", "update_finding_status", "update_target",
@@ -261,6 +263,8 @@ class MasterAgent:
         self.claims: ClaimRegistry = ClaimRegistry()
         self.moderator: Moderator = Moderator()
         self.termination: TerminationController = TerminationController()
+        self.irc: IRC = IRC()
+        self.project_note: ProjectNote = ProjectNote()
         self._forum_cursor: int = 0
         self._last_moderator_render: str = ""
         self._intent_agent_map: dict[str, str] = {}
@@ -576,6 +580,12 @@ class MasterAgent:
                 f"{self.project_memory}\n"
                 f"(来自 {self.project_memory_path})\n"
             )
+        note_block = ""
+        try:
+            if self.project_note.count() > 0:
+                note_block = "\n" + self.project_note.render() + "\n"
+        except Exception:
+            logger.exception("project note render failed")
         model_name = self._current_model() or "未知模型"
         return (
             "你是 DRX-Operator，一个自主红队渗透测试专家系统。\n"
@@ -682,6 +692,7 @@ class MasterAgent:
             "\n"
             "高危操作（漏洞利用/横向移动/破坏性）需用户审批，先告知再执行。"
             + memory_block
+            + note_block
         )
 
     def _build_tool_schemas(self) -> list[dict]:
@@ -1872,6 +1883,122 @@ class MasterAgent:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "irc_send",
+                    "description": (
+                        "向指定 agent 发送一条定向点对点消息（IRC）。无广播、无话题、"
+                        "无线程，只有收件人能回复；回复后原消息标记为已答。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "to": {"type": "string", "description": "收件 agent_id"},
+                            "content": {"type": "string", "description": "消息正文"},
+                            "reply_to": {"type": "integer", "description": "回复的消息 id（可选）"},
+                        },
+                        "required": ["to", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "irc_inbox",
+                    "description": "读取发给 master 的定向消息收件箱（可只看未读），内容有界。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "unread_only": {"type": "boolean", "description": "只返回未读，默认 false"},
+                            "limit": {"type": "integer", "description": "最多条数，默认 20"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "irc_reply",
+                    "description": "回复发给 master 的一条定向消息（只有原始收件人能回复）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "integer", "description": "要回复的消息 id"},
+                            "content": {"type": "string", "description": "回复正文"},
+                        },
+                        "required": ["message_id", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "irc_pending",
+                    "description": "列出 master 仍需作答的定向消息（open 状态）。",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "irc_close",
+                    "description": "关闭一条定向消息（只有发送者或收件人可关闭）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "integer", "description": "消息 id"},
+                            "reason": {"type": "string", "description": "关闭原因"},
+                        },
+                        "required": ["message_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "note_update",
+                    "description": "向结构化项目笔记的某一节追加一条持久项目知识（去重、有界）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "section": {"type": "string", "description": "笔记节名"},
+                            "text": {"type": "string", "description": "记录正文"},
+                            "source": {"type": "string", "description": "来源/证据引用（可选）"},
+                        },
+                        "required": ["section", "text"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "note_read",
+                    "description": "读取结构化项目笔记：给 section 读单节，省略读全部非空节。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "section": {"type": "string", "description": "笔记节名（可选）"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "note_clear",
+                    "description": "清空结构化项目笔记：给 section 清单节，省略清空全部。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "section": {"type": "string", "description": "笔记节名（可选）"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
         ] + self.mcp.openai_tool_schemas()
 
 
@@ -2053,6 +2180,11 @@ class MasterAgent:
         elif name == "claim_status":
             preview = f"work_item={args.get('work_item', '*')}"
         elif name in ("team_status", "request_close", "forum_digest", "forum_wait"):
+            preview = name
+        elif name in (
+            "irc_send", "irc_inbox", "irc_reply", "irc_pending", "irc_close",
+            "note_update", "note_read", "note_clear",
+        ):
             preview = name
         elif name == "parse_nmap":
             preview = f"{len(args.get('output', ''))} chars of nmap output"
@@ -2300,6 +2432,22 @@ class MasterAgent:
                 result_text = self._tool_team_status(args)
             elif name == "request_close":
                 result_text = self._tool_request_close(args)
+            elif name == "irc_send":
+                result_text = self._tool_irc_send(args)
+            elif name == "irc_inbox":
+                result_text = self._tool_irc_inbox(args)
+            elif name == "irc_reply":
+                result_text = self._tool_irc_reply(args)
+            elif name == "irc_pending":
+                result_text = self._tool_irc_pending(args)
+            elif name == "irc_close":
+                result_text = self._tool_irc_close(args)
+            elif name == "note_update":
+                result_text = self._tool_note_update(args)
+            elif name == "note_read":
+                result_text = self._tool_note_read(args)
+            elif name == "note_clear":
+                result_text = self._tool_note_clear(args)
             elif name == "stage_advance":
                 result_text = self._tool_stage_advance(args)
             elif name == "intent_add":
@@ -3330,6 +3478,94 @@ class MasterAgent:
                 {"ok": False, "error": f"request_close failed: {exc}"}, ensure_ascii=False
             )
 
+    # ------------------------------------------------------ irc + project note
+
+    def _tool_irc_send(self, args: dict) -> str:
+        to_agent = str(args.get("to", "") or "")
+        content = str(args.get("content", "") or "")
+        reply_to = int(args.get("reply_to", 0) or 0)
+        mid = self.irc.send("master", to_agent, content, reply_to=reply_to)
+        if mid is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "empty content, self-DM, or reply_to target is not an "
+                        "open message addressed to master"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps({"ok": True, "message_id": mid}, ensure_ascii=False)
+
+    def _tool_irc_inbox(self, args: dict) -> str:
+        msgs = self.irc.inbox(
+            "master",
+            unread_only=bool(args.get("unread_only", False)),
+            limit=int(args.get("limit", 20) or 20),
+        )
+        return json.dumps({"ok": True, "messages": msgs}, ensure_ascii=False)
+
+    def _tool_irc_reply(self, args: dict) -> str:
+        mid = self.irc.reply(
+            "master",
+            int(args.get("message_id", 0) or 0),
+            str(args.get("content", "") or ""),
+        )
+        if mid is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "reply refused: message not found or not addressed to master",
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps({"ok": True, "message_id": mid}, ensure_ascii=False)
+
+    def _tool_irc_pending(self, args: dict) -> str:
+        msgs = self.irc.pending_for("master")
+        return json.dumps({"ok": True, "pending": msgs}, ensure_ascii=False)
+
+    def _tool_irc_close(self, args: dict) -> str:
+        ok = self.irc.close(
+            int(args.get("message_id", 0) or 0),
+            agent="master",
+            reason=str(args.get("reason", "") or ""),
+        )
+        return json.dumps({"ok": ok}, ensure_ascii=False)
+
+    def _tool_note_update(self, args: dict) -> str:
+        section = str(args.get("section", "") or "")
+        text = str(args.get("text", "") or "")
+        source = str(args.get("source", "") or "")
+        ok = self.project_note.update(section, text, author="master", source=source)
+        if not ok:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "unknown/empty section or empty/duplicate text",
+                    "valid_sections": list(NOTE_SECTIONS),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps({"ok": True}, ensure_ascii=False)
+
+    def _tool_note_read(self, args: dict) -> str:
+        section = str(args.get("section", "") or "")
+        if section:
+            return json.dumps(
+                {"ok": True, "section": section, "entries": self.project_note.get(section)},
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {"ok": True, "sections": self.project_note.sections()},
+            ensure_ascii=False,
+        )
+
+    def _tool_note_clear(self, args: dict) -> str:
+        removed = self.project_note.clear(str(args.get("section", "") or ""))
+        return json.dumps({"ok": True, "removed": removed}, ensure_ascii=False)
+
     def _freeze_all_workers(self) -> None:
         """Cancel every running worker and clear the worker maps on stage change."""
         for iid in list(self._intent_agent_map.keys()):
@@ -3723,6 +3959,7 @@ class MasterAgent:
         _intent_holder: dict[str, str] = {"id": intent.id}
         _agent_id_holder: dict[str, str] = {"id": ""}
         _notif_cursor: dict[str, int] = {"cursor": 0}
+        _irc_cursor: dict[str, int] = {"cursor": 0}
 
         async def _sub_executor(name: str, tool_args: dict) -> str:
             if name != "stage_advance" and not self.stage_machine.is_allowed(name):
@@ -3774,22 +4011,32 @@ class MasterAgent:
         def _notif_provider() -> str:
             try:
                 agent_id = _agent_id_holder["id"]
+                parts: list[str] = []
                 msgs = self.forum.wait(
                     agent_id, after_id=_notif_cursor["cursor"], limit=10
                 )
-                if not msgs:
-                    return ""
-                _notif_cursor["cursor"] = max(m["id"] for m in msgs)
-                lines = []
-                for m in msgs:
-                    tag = m.get("epistemic_status", "")
-                    lines.append(
-                        f"- #{m['id']} <{m['agent_id']}> [{tag}] "
-                        f"{m['content'][:200]}"
-                    )
-                return "【论坛通知】\n" + "\n".join(lines)
+                if msgs:
+                    _notif_cursor["cursor"] = max(m["id"] for m in msgs)
+                    lines = []
+                    for m in msgs:
+                        tag = m.get("epistemic_status", "")
+                        lines.append(
+                            f"- #{m['id']} <{m['agent_id']}> [{tag}] "
+                            f"{m['content'][:200]}"
+                        )
+                    parts.append("【论坛通知】\n" + "\n".join(lines))
+                pending_irc = self.irc.pending_for(agent_id, limit=10)
+                new_irc = [m for m in pending_irc if m["id"] > _irc_cursor["cursor"]]
+                if new_irc:
+                    _irc_cursor["cursor"] = max(m["id"] for m in new_irc)
+                    irc_lines = [
+                        f"- #{m['id']} <{m['from_agent']}> {m['content'][:200]}"
+                        for m in new_irc
+                    ]
+                    parts.append("【IRC 定向消息】\n" + "\n".join(irc_lines))
+                return "\n\n".join(parts)
             except Exception:
-                logger.exception("forum notification provider failed")
+                logger.exception("sub-agent notification provider failed")
                 return ""
 
         sub.notification_provider = _notif_provider

@@ -43,6 +43,8 @@ ALWAYS_ALLOWED: frozenset[str] = frozenset(
         "forum_pin", "forum_close", "forum_wait",
         "claim_acquire", "claim_release", "claim_status",
         "team_status", "request_close",
+        "irc_send", "irc_inbox", "irc_reply", "irc_pending", "irc_close",
+        "note_update", "note_read", "note_clear",
     }
 )
 
