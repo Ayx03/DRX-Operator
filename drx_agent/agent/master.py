@@ -20,9 +20,12 @@ from drx_agent.agent.blackboard import Blackboard, SECTIONS
 from drx_agent.agent.finding import Evidence, Finding
 from drx_agent.agent.knowledge_base import Credential
 from drx_agent.agent.artifact_store import ArtifactStore
+from drx_agent.agent.evidence import EvidenceStore, VALID_ORIGINS
 from drx_agent.agent.prompts import METHODOLOGY_PROMPT, SUB_AGENT_DISCIPLINE
 from drx_agent.agent.sub_agent import SubAgent, SubAgentResult, SubAgentStatus
 from drx_agent.agent.frontier import Frontier
+from drx_agent.agent.handoff import Handoff
+from drx_agent.agent.stage import StageMachine
 from drx_agent.agent.task_scheduler import TaskPriority, TaskScheduler
 from drx_agent.engine.bash_sandbox import BashSandbox, BLOCKED_PATTERNS
 from drx_agent.engine.python_sandbox import PythonSandbox, SandboxResult
@@ -74,6 +77,132 @@ JUDGE_SYSTEM_PROMPT = """你在 Fact-Intent 图上做面向目标的判断，不
 """
 
 
+# ---- Verifier 层（fresh-context 证伪）----
+# 验证员是全新上下文：不继承父对话/候选作者推理，只有候选 schema + 证据引用 + 最小项目地图。
+# 目标不是确认，而是尝试否定；找不到合理反证且证据链成立才确认。
+_VERIFIER_TOOL_NAMES = frozenset(
+    {
+        "read_file", "grep", "read_artifact", "read_handoff", "blackboard_read",
+        "list_findings", "http_fetch", "execute_bash", "execute_python",
+        "shell_list", "evidence_add",
+    }
+)
+
+_VALID_VERDICTS = ("confirmed", "likely", "uncertain", "rejected")
+_VALID_RECOMMENDATIONS = ("report", "investigate", "reject")
+
+VERIFIER_SYSTEM_PROMPT = (
+    "你是独立的漏洞证伪验证员（fresh context）。你没有父对话、没有候选作者的推理，"
+    "只收到候选发现的结构化数据 + 证据引用。\n"
+    "你的目标不是确认，而是**尝试否定**这条候选发现：只有在找不到任何合理反证、"
+    "且源码/证据链确实成立时，才予以确认。\n"
+    "纪律：\n"
+    "- 必须自己读源码/证据（read_file/grep/read_artifact/list_findings/read_handoff），"
+    "不得信任候选自述。\n"
+    "- 缺证据就写进 missing_evidence，不得臆测填补。\n"
+    "- 有反证或证据不足时给出 rejected/uncertain，不得硬确认。\n"
+    "- 「存在 bug」与「根因正确」是两回事：impact_supported 与 root_cause_supported 分别判定。\n"
+    "- 你没有上报/写文件/记发现/生成报告/递归验证的权限。\n"
+    "最终只输出一个 JSON 判定对象（不要输出任何其他文字），格式：\n"
+    '{"verdict": "confirmed|likely|uncertain|rejected", "confidence": 0.0-1.0, '
+    '"independent_evidence": ["..."], "reproduced_path": ["..."], '
+    '"counterevidence": ["..."], "missing_evidence": ["..."], '
+    '"impact_supported": true/false, "root_cause_supported": true/false, '
+    '"recommended_action": "report|investigate|reject"}\n'
+    "候选发现（candidate）如下：\n"
+)
+
+
+def _normalize_verdict(obj: dict, note: str = "") -> dict:
+    """Coerce a raw verifier JSON object into the graded verdict schema."""
+    verdict = str(obj.get("verdict", "uncertain"))
+    if verdict not in _VALID_VERDICTS:
+        verdict = "uncertain"
+    try:
+        confidence = float(obj.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    def _strs(key: str) -> list[str]:
+        val = obj.get(key) or []
+        if not isinstance(val, (list, tuple)):
+            return []
+        return [str(x) for x in val]
+
+    recommended = str(obj.get("recommended_action", "investigate"))
+    if recommended not in _VALID_RECOMMENDATIONS:
+        recommended = "investigate"
+    out = {
+        "verdict": verdict,
+        "confidence": confidence,
+        "independent_evidence": _strs("independent_evidence"),
+        "reproduced_path": _strs("reproduced_path"),
+        "counterevidence": _strs("counterevidence"),
+        "missing_evidence": _strs("missing_evidence"),
+        "impact_supported": bool(obj.get("impact_supported", False)),
+        "root_cause_supported": bool(obj.get("root_cause_supported", False)),
+        "recommended_action": recommended,
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
+def _dedup_list(*lists: list) -> list[str]:
+    """Concatenate string lists preserving first-seen order, dropping dups."""
+    out: list[str] = []
+    for lst in lists:
+        for item in lst or []:
+            s = str(item)
+            if s not in out:
+                out.append(s)
+    return out
+
+
+def _parse_verdict_json(text: str) -> dict:
+    """Tolerant parse of the verifier's final text into the verdict schema.
+
+    Strips markdown code fences, finds the first balanced JSON object, and
+    coerces fields. Never raises — an unparseable output degrades to an
+    ``uncertain`` verdict with a note.
+    """
+    raw = (text or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+    start = raw.find("{")
+    if start == -1:
+        return _normalize_verdict({}, note="verifier produced no JSON object")
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(raw[start : i + 1])
+                except (json.JSONDecodeError, TypeError):
+                    break
+                if isinstance(obj, dict):
+                    return _normalize_verdict(obj)
+                break
+    return _normalize_verdict({}, note="verifier output could not be parsed as JSON")
+
+
 class MasterAgent:
     """Autonomous master agent driving a ReAct loop; integrates EventBus,
     TaskScheduler, sandboxes, KnowledgeBase, SafetyGate, SkillsRegistry
@@ -84,7 +213,7 @@ class MasterAgent:
     _PLAN_MODE_READONLY_TOOLS: set = {
         "read_file", "grep", "http_fetch", "web_search", "cve_lookup",
         "parse_nmap", "parse_http", "todo_write", "shell_list",
-        "list_findings", "blackboard_read",
+        "list_findings", "blackboard_read", "read_handoff",
     }
 
     def __init__(
@@ -122,6 +251,8 @@ class MasterAgent:
         self.active_sub_agents: dict[str, SubAgent] = {}
         self.active_sub_agent_tasks: dict[str, asyncio.Task] = {}
         self.frontier: Frontier = Frontier()
+        self.handoff: Handoff | None = None
+        self.stage_machine: StageMachine = StageMachine()
         self._intent_agent_map: dict[str, str] = {}
         self.frontier.on_invalidate = self._on_frontier_invalidate
         self._current_intent_id: str | None = None
@@ -174,6 +305,15 @@ class MasterAgent:
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "sessions", "artifacts",
             )
+        )
+        # Immutable evidence store (disk-backed index + full content offloaded
+        # to the artifact store). Same base dir → stable across restores.
+        self.evidence = EvidenceStore(
+            base_dir=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "sessions", "evidence",
+            ),
+            artifact_store=self.artifacts,
         )
         self.shells = ShellSessionManager(max_sessions=8)
         self.oob = OOBListener()
@@ -526,6 +666,8 @@ class MasterAgent:
             "\n"
             f"{self.blackboard.render(2000)}\n"
             "\n"
+            f"{self.stage_machine.render()}\n"
+            "\n"
             "高危操作（漏洞利用/横向移动/破坏性）需用户审批，先告知再执行。"
             + memory_block
         )
@@ -818,6 +960,80 @@ class MasterAgent:
                         "properties": {
                             "host": {"type": "string"},
                         },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "verify_finding",
+                    "description": (
+                        "对一条候选发现做 fresh-context 对抗式验证：派一个全新上下文的"
+                        "验证员 Worker 尝试**证伪**该发现（自己读源码/证据，不继承你的推理），"
+                        "返回分级判定 verdict（confirmed/likely/uncertain/rejected）+ 置信度。"
+                        "用 host + claim 子串定位，或用 finding_index 按顺序定位。"
+                        "critical 发现可传 double=true 跑双盲验证（两名验证员互不知情，"
+                        "聚合比对）。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "host": {
+                                "type": "string",
+                                "description": "发现所在 host（配合 claim 子串定位）",
+                            },
+                            "claim": {
+                                "type": "string",
+                                "description": "发现的 claim 子串，用于定位候选",
+                            },
+                            "finding_index": {
+                                "type": "integer",
+                                "description": "按 list_findings 顺序的第几个发现（0 起）",
+                            },
+                            "double": {
+                                "type": "boolean",
+                                "description": "是否双盲验证（critical 发现建议 true），默认 false",
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "evidence_add",
+                    "description": (
+                        "把一条原始证据存入不可变证据库，返回稳定的 E-xxxx 证据 ID。"
+                        "相同的证据内容只存一份（按内容去重，重复提交返回已有 ID）。"
+                        "拿到工具输出的关键数据（命令输出、HTTP 响应、文件内容）时先 "
+                        "evidence_add 存档，再在 record_finding 的 evidence 里引用证据 ID。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "原始证据内容（命令输出/响应正文/文件片段）",
+                            },
+                            "origin": {
+                                "type": "string",
+                                "enum": list(VALID_ORIGINS),
+                                "description": "证据来源：source/runtime/tool/network/file",
+                            },
+                            "kind": {
+                                "type": "string",
+                                "description": "证据类别，如 tool_output/http_response/file_content",
+                            },
+                            "location": {
+                                "type": "string",
+                                "description": "证据出处（文件路径或产生它的命令）",
+                            },
+                            "revision": {
+                                "type": "string",
+                                "description": "版本标识，如工具名+版本或扫描轮次",
+                            },
+                        },
+                        "required": ["content"],
                     },
                 },
             },
@@ -1430,7 +1646,81 @@ class MasterAgent:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_handoff",
+                    "description": (
+                        "读取跨阶段交接容器 Handoff（结构化状态，不是对话历史）。"
+                        "先 read_handoff() 拿短索引，再按需 read_handoff(section=...) "
+                        "分页读某一区段，或 read_handoff(item_id=...) 取单条。可用区段："
+                        "facts/hypotheses/candidates/negative_findings/open_questions/"
+                        "entrypoints/trust_boundaries/important_files/evidence_refs/"
+                        "recommended_work。每条目都带 status（认知状态）与 producer（出处），"
+                        "存在不等于必须全读——只取当前任务需要的部分。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "section": {
+                                "type": "string",
+                                "description": "区段名；省略返回索引",
+                            },
+                            "item_id": {
+                                "type": "string",
+                                "description": "单条 id（如 CAND-a1b2c3）；优先于 section",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "分页起始下标，默认 0",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "每页条数，默认 20",
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+            },
         ] + self.mcp.openai_tool_schemas()
+
+
+    def _stage_advance_schema(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "stage_advance",
+                "description": (
+                    "推进到下一阶段：构建结构化 Handoff（交接容器，非对话历史）、"
+                    "冻结当前运行中的 Worker、切换到下一阶段并起新 Worker。"
+                    "推进由程序层 gate 把关：RECON 需有实质产出、RESEARCH 需有候选/"
+                    "假设、VERIFY 需有已验证发现。若 gate 拒绝而确有把握可传 force=true。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "推进理由（可选，写入阶段历史账本）",
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "跳过 gate 强推（慎用），默认 false",
+                        },
+                    },
+                },
+            },
+        }
+
+    def _active_tool_schemas(self) -> list[dict]:
+        """Stage-filtered tool schemas the model sees, plus stage_advance.
+
+        Kept deterministic (sorted) so the tool-list prefix stays cacheable."""
+        schemas = self.stage_machine.filter_schemas(self._build_tool_schemas())
+        schemas.append(self._stage_advance_schema())
+        schemas.sort(key=lambda s: s["function"]["name"])
+        return schemas
 
 
     def _safety_risk_level(self, name: str, args: dict) -> Optional[RiskLevel]:
@@ -1467,6 +1757,20 @@ class MasterAgent:
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         
+        # P2 防御纵深：阶段能力边界。声明期过滤（_active_tool_schemas）之外，
+        # 执行期再拒一次——缓存工具列表 / 子 Agent 都无法绕过程序层边界。
+        if name != "stage_advance" and not self.stage_machine.is_allowed(name):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        f"工具 {name} 在 {self.stage_machine.stage.value} "
+                        "阶段不可用（阶段能力边界）"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
         if name == "http_fetch":
             preview = f"{args.get('method', 'GET')} {args.get('url', '')}"
         elif name == "execute_bash":
@@ -1541,6 +1845,16 @@ class MasterAgent:
             preview = f"path={args.get('path', '?')} n={args.get('n', 100)}"
         elif name == "read_artifact":
             preview = f"artifact={args.get('artifact_id', '?')}"
+        elif name == "evidence_add":
+            preview = (
+                f"origin={args.get('origin', 'tool')} "
+                f"({len(str(args.get('content', '')))} chars)"
+            )
+        elif name == "read_handoff":
+            preview = (
+                f"section={args.get('section', '*')} "
+                f"item={args.get('item_id', '*')}"
+            )
         elif name == "parse_nmap":
             preview = f"{len(args.get('output', ''))} chars of nmap output"
         elif name == "parse_http":
@@ -1753,10 +2067,18 @@ class MasterAgent:
                 result_text = self._tool_update_finding_status(args)
             elif name == "list_findings":
                 result_text = self._tool_list_findings(args)
+            elif name == "verify_finding":
+                result_text = await self._tool_verify_finding(args)
+            elif name == "evidence_add":
+                result_text = self._tool_evidence_add(args)
             elif name == "blackboard_write":
                 result_text = self._tool_blackboard_write(args)
             elif name == "blackboard_read":
                 result_text = self._tool_blackboard_read(args)
+            elif name == "read_handoff":
+                result_text = self._tool_read_handoff(args)
+            elif name == "stage_advance":
+                result_text = self._tool_stage_advance(args)
             elif name == "intent_add":
                 result_text = self._tool_intent_add(args)
             elif name == "intent_list":
@@ -2205,6 +2527,26 @@ class MasterAgent:
         self.knowledge_base.update_target(host, **update)
         return json.dumps({"ok": True, "host": host, "updated": list(update.keys()) + (["owned"] if args.get("owned") else [])}, ensure_ascii=False)
 
+    def _tool_evidence_add(self, args: dict) -> str:
+        content = args.get("content")
+        if not content:
+            return json.dumps({"error": "content required"}, ensure_ascii=False)
+        origin = args.get("origin") or "tool"
+        if origin not in VALID_ORIGINS:
+            return json.dumps(
+                {"error": f"origin must be one of {list(VALID_ORIGINS)}"},
+                ensure_ascii=False,
+            )
+        evidence_id = self.evidence.put(
+            str(content),
+            origin=origin,
+            kind=args.get("kind") or "evidence",
+            location=args.get("location") or "",
+            revision=args.get("revision") or "",
+            producer="evidence_add",
+        )
+        return json.dumps({"ok": True, "evidence_id": evidence_id}, ensure_ascii=False)
+
     def _tool_record_finding(self, args: dict) -> str:
         host = args.get("host") or "unknown"
         claim = (args.get("claim") or "").strip()
@@ -2220,10 +2562,23 @@ class MasterAgent:
             confidence = float(args.get("confidence", 0.5))
         except (TypeError, ValueError):
             confidence = 0.5
-        evidence = [
-            Evidence(type="tool_output", value=str(e)[:300])
-            for e in (args.get("evidence") or [])[:5]
-        ]
+        evidence = []
+        for raw in (args.get("evidence") or [])[:5]:
+            text = str(raw)
+            evidence_id = self.evidence.put(
+                text,
+                origin="tool",
+                kind="finding_evidence",
+                location=host,
+                producer="record_finding",
+            )
+            evidence.append(
+                Evidence(
+                    type="tool_output",
+                    value=text[:300],
+                    evidence_id=evidence_id,
+                )
+            )
         finding = Finding(
             claim=claim,
             confidence=confidence,
@@ -2323,6 +2678,200 @@ class MasterAgent:
             {"findings": rows[:50], "count": len(rows)}, ensure_ascii=False
         )
 
+    def _locate_finding(self, host: str, claim: str, finding_index):
+        """Locate a candidate finding by (host, claim-substr) or by flat index."""
+        findings = self.knowledge_base.all_findings()
+        if finding_index is not None:
+            try:
+                idx = int(finding_index)
+            except (TypeError, ValueError):
+                return None
+            if 0 <= idx < len(findings):
+                return findings[idx]
+            return None
+        for f_host, f_obj in findings:
+            if host and f_host != host:
+                continue
+            if claim and claim.lower() not in f_obj.claim.lower():
+                continue
+            return (f_host, f_obj)
+        return None
+
+    def _candidate_payload(self, host: str, finding: Finding) -> dict:
+        """Minimal handoff for the verifier: candidate + evidence refs + project
+        map. Deliberately excludes the parent conversation and the candidate
+        author's reasoning."""
+        evidence = []
+        evidence_ids = []
+        for e in (finding.evidence or []):
+            evidence.append(f"{e.type}: {e.value or e.cve or e.payload}")
+            if e.evidence_id:
+                evidence_ids.append(e.evidence_id)
+        evidence_refs = []
+        for e in (finding.evidence or []):
+            if e.evidence_id:
+                rec = self.evidence.get(e.evidence_id)
+                evidence_refs.append(
+                    {
+                        "evidence_id": e.evidence_id,
+                        "preview": (rec.preview if rec else "") or (e.value[:200] if e.value else ""),
+                        "location": (rec.location if rec else ""),
+                    }
+                )
+            elif e.value:
+                evidence_refs.append({"type": e.type, "value": e.value[:300]})
+        project_map = {
+            "cwd": os.getcwd(),
+            "targets": [
+                {"host": t.get("host"), "open_ports": t.get("open_ports", [])}
+                for t in self.knowledge_base.list_targets()
+            ],
+        }
+        return {
+            "candidate": {
+                "claim": finding.claim,
+                "host": host,
+                "severity": finding.severity,
+                "confidence": finding.confidence,
+                "evidence": evidence,
+                "evidence_ids": evidence_ids,
+            },
+            "evidence_refs": evidence_refs,
+            "project_map": project_map,
+        }
+
+    @staticmethod
+    def _adjudicate(verdict_a: dict, verdict_b: dict) -> dict:
+        a_v = verdict_a.get("verdict")
+        b_v = verdict_b.get("verdict")
+        if a_v == b_v:
+            try:
+                conf = (
+                    float(verdict_a.get("confidence", 0.0))
+                    + float(verdict_b.get("confidence", 0.0))
+                ) / 2.0
+            except (TypeError, ValueError):
+                conf = float(verdict_a.get("confidence", 0.0) or 0.0)
+            merged = _normalize_verdict(verdict_a)
+            merged["confidence"] = round(max(0.0, min(1.0, conf)), 4)
+            merged["independent_evidence"] = _dedup_list(
+                verdict_a.get("independent_evidence"), verdict_b.get("independent_evidence")
+            )
+            merged["reproduced_path"] = _dedup_list(
+                verdict_a.get("reproduced_path"), verdict_b.get("reproduced_path")
+            )
+            merged["counterevidence"] = _dedup_list(
+                verdict_a.get("counterevidence"), verdict_b.get("counterevidence")
+            )
+            merged["missing_evidence"] = _dedup_list(
+                verdict_a.get("missing_evidence"), verdict_b.get("missing_evidence")
+            )
+            merged["impact_supported"] = bool(verdict_a.get("impact_supported")) and bool(
+                verdict_b.get("impact_supported")
+            )
+            merged["root_cause_supported"] = bool(verdict_a.get("root_cause_supported")) and bool(
+                verdict_b.get("root_cause_supported")
+            )
+            merged["adjudication"] = "double-blind 一致"
+            return merged
+        return {
+            "verdict": "uncertain",
+            "confidence": 0.0,
+            "independent_evidence": [],
+            "reproduced_path": [],
+            "counterevidence": [],
+            "missing_evidence": [],
+            "impact_supported": False,
+            "root_cause_supported": False,
+            "recommended_action": "investigate",
+            "adjudication": f"double-blind 分歧：A={a_v} vs B={b_v}",
+        }
+
+    async def _run_verifier(
+        self, candidate_payload: dict, *, label: str = "verify-a"
+    ) -> dict:
+        """Spawn a fresh-context adversarial verifier SubAgent and return its
+        graded verdict. No frontier intent is ticked (there is none)."""
+        candidate_json = json.dumps(candidate_payload, ensure_ascii=False)
+        system_prompt = VERIFIER_SYSTEM_PROMPT + candidate_json
+        task = (
+            "请独立证伪这条候选发现：自己读源码与证据，尝试否定它。"
+            "找不到合理反证且证据链成立才确认。最终只输出 JSON 判定。"
+        )
+        tools = [
+            t for t in self._build_tool_schemas()
+            if t["function"]["name"] in _VERIFIER_TOOL_NAMES
+        ]
+
+        async def _sub_executor(name: str, tool_args: dict) -> str:
+            self._sub_exec_depth += 1
+            try:
+                return await self._execute_tool(name, tool_args)
+            finally:
+                self._sub_exec_depth -= 1
+
+        sub = SubAgent(
+            agent_type=f"verifier-{label}",
+            target=str(candidate_payload.get("candidate", {}).get("host") or "unknown"),
+            task=task,
+            event_bus=self.event_bus,
+            llm_provider=self.llm_provider,
+            tool_executor=_sub_executor,
+            tool_schemas=tools,
+            system_prompt=system_prompt,
+            ttl=240,
+            max_iterations=8,
+            parallel_tool_calls=False,
+            usage_callback=self._record_usage,
+        )
+        self.active_sub_agents[sub.agent_id] = sub
+        try:
+            result = await sub.run()
+        finally:
+            self.active_sub_agents.pop(sub.agent_id, None)
+        return _parse_verdict_json(result.text)
+
+    async def _tool_verify_finding(self, args: dict) -> str:
+        host = str(args.get("host") or "")
+        claim = str(args.get("claim") or "")
+        finding_index = args.get("finding_index")
+        double = bool(args.get("double", False))
+
+        located = self._locate_finding(host, claim, finding_index)
+        if located is None:
+            return json.dumps({"ok": False, "error": "finding not found"}, ensure_ascii=False)
+        f_host, finding = located
+
+        candidate_payload = self._candidate_payload(f_host, finding)
+        verdict_a = await self._run_verifier(candidate_payload, label="verify-a")
+
+        if not double:
+            finding.verification = verdict_a
+            return json.dumps(
+                {
+                    "ok": True,
+                    "verdict": verdict_a,
+                    "finding": {"host": f_host, "claim": finding.claim[:120]},
+                },
+                ensure_ascii=False,
+            )
+
+        verdict_b = await self._run_verifier(candidate_payload, label="verify-b")
+        adjudicated = self._adjudicate(verdict_a, verdict_b)
+        finding.verification = {
+            "verifier_a": verdict_a,
+            "verifier_b": verdict_b,
+            "adjudicated": adjudicated,
+        }
+        return json.dumps(
+            {
+                "ok": True,
+                "verdict": adjudicated,
+                "finding": {"host": f_host, "claim": finding.claim[:120]},
+            },
+            ensure_ascii=False,
+        )
+
     def _tool_blackboard_write(self, args: dict) -> str:
         ok = self.blackboard.add(
             args.get("section", ""),
@@ -2346,6 +2895,93 @@ class MasterAgent:
             )
         return json.dumps(self.blackboard.to_dict(), ensure_ascii=False)
 
+    def _tool_read_handoff(self, args: dict) -> str:
+        if self.handoff is None:
+            return json.dumps(
+                {"ok": False, "error": "no handoff available"}, ensure_ascii=False
+            )
+        try:
+            text = self.handoff.read(
+                section=args.get("section"),
+                item_id=args.get("item_id"),
+                offset=int(args.get("offset", 0) or 0),
+                limit=int(args.get("limit", 20) or 20),
+            )
+        except (KeyError, ValueError, TypeError):
+            return json.dumps(
+                {"ok": False, "error": "invalid handoff read arguments"},
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "ok": True,
+                "section": args.get("section"),
+                "item_id": args.get("item_id"),
+                "text": text,
+            },
+            ensure_ascii=False,
+        )
+
+    def _freeze_all_workers(self) -> None:
+        """Cancel every running worker and clear the worker maps on stage change."""
+        for iid in list(self._intent_agent_map.keys()):
+            agent_id = self._intent_agent_map.pop(iid, None)
+            if agent_id is None:
+                continue
+            sub = self.active_sub_agents.get(agent_id)
+            if sub is not None:
+                sub.request_stop()
+            task = self.active_sub_agent_tasks.get(agent_id)
+            if task is not None and not task.done():
+                task.cancel()
+            self.frontier.release(iid)
+        for task in list(self.active_sub_agent_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self.active_sub_agents.clear()
+        self.active_sub_agent_tasks.clear()
+        self._intent_agent_map.clear()
+
+    def _tool_stage_advance(self, args: dict) -> str:
+        from_stage = self.stage_machine.stage
+        force = bool(args.get("force", False))
+        reason = str(args.get("reason", "") or "")
+
+        self.handoff = Handoff.build_from(
+            self.frontier, self.blackboard, self.knowledge_base
+        )
+        self.handoff.phase = from_stage.value
+
+        ok, gate_reason = self.stage_machine.gate(
+            self.handoff, self.frontier, self.knowledge_base
+        )
+        if not ok and not force:
+            return json.dumps({"ok": False, "error": gate_reason}, ensure_ascii=False)
+
+        self._freeze_all_workers()
+        self._set_current_intent(None)
+
+        new_stage = self.stage_machine.advance(reason)
+        if new_stage is None:
+            return json.dumps(
+                {"ok": False, "error": "已处于最后阶段，无法推进"}, ensure_ascii=False
+            )
+
+        self.publish_action(
+            f"阶段交接：{from_stage.value} → {new_stage.value}；"
+            f"新建 {new_stage.value} Worker，按需 read_handoff 读取结构化交接，"
+            "不继承原始对话。"
+        )
+
+        return json.dumps(
+            {
+                "ok": True,
+                "stage": new_stage.value,
+                "handoff_index": self.handoff.render_index(),
+            },
+            ensure_ascii=False,
+        )
+
     def _tool_intent_add(self, args: dict) -> str:
         hypothesis = str(args.get("hypothesis", ""))
         similar = self.frontier.find_similar_dead_end(hypothesis)
@@ -2368,6 +3004,7 @@ class MasterAgent:
             expiry_s=float(args.get("expiry_s", 900.0) or 900.0),
             depends_on=tuple(args.get("depends_on") or ()),
             evidence=tuple(args.get("evidence") or ()),
+            stage=self.stage_machine.stage.value,
         )
         if iid is None:
             return json.dumps(
@@ -2668,14 +3305,27 @@ class MasterAgent:
         )
         sub_system += SUB_AGENT_DISCIPLINE
         sub_system += "\n" + self.blackboard.render(1500) + "\n"
-        tools = [
-            t for t in self._build_tool_schemas()
-            if t["function"]["name"] not in ("task", "intent_batch")
-        ]
+        tools = self.stage_machine.filter_schemas(
+            [
+                t for t in self._build_tool_schemas()
+                if t["function"]["name"] not in ("task", "intent_batch")
+            ]
+        )
 
         _intent_holder: dict[str, str] = {"id": intent.id}
 
         async def _sub_executor(name: str, tool_args: dict) -> str:
+            if name != "stage_advance" and not self.stage_machine.is_allowed(name):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"工具 {name} 在 {self.stage_machine.stage.value} "
+                            "阶段不可用（阶段能力边界）"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             self._sub_exec_depth += 1
             try:
                 res = await self._execute_tool(name, tool_args)
@@ -2715,7 +3365,7 @@ class MasterAgent:
     ) -> list[dict]:
         max_workers = max(1, min(int(max_workers), 4))
         candidates = [
-            i for i in self.frontier.list_open()
+            i for i in self.frontier.list_open_for_stage(self.stage_machine.stage.value)
             if i.priority <= priority_cap
         ]
         if scope:
@@ -4055,6 +4705,7 @@ class MasterAgent:
             priority=TaskPriority.RECON.value,
             max_steps=sub.max_iterations,
             expiry_s=float(sub.ttl),
+            stage=self.stage_machine.stage.value,
         )
         if intent_id:
             self.frontier.claim(intent_id)
@@ -4784,7 +5435,7 @@ class MasterAgent:
 
     async def _run_chat_locked(self) -> None:
         
-        tools = self._build_tool_schemas()
+        tools = self._active_tool_schemas()
         system_prompt = self._build_system_prompt()
         self._chat_active = True
         self._interrupt = False
@@ -5438,6 +6089,7 @@ class MasterAgent:
                 priority=priority.value,
                 max_steps=sub.max_iterations,
                 expiry_s=float(sub.ttl),
+                stage=self.stage_machine.stage.value,
             )
         if intent_id:
             self.frontier.claim(intent_id)

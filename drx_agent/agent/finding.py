@@ -10,6 +10,8 @@ class Evidence:
     version_range: str = ""
     payload: str = ""
     result: str = ""
+    # EvidenceStore reference; "" for pre-store serialized findings (backwards compat).
+    evidence_id: str = ""
 
 
 @dataclass
@@ -22,6 +24,11 @@ class Finding:
     severity: str = "info"
     status: str = "suspected"
     superseded_by: str = ""
+    # Graded adversarial verdict (P5 verifier). Backwards compatible: empty by
+    # default; from_dict tolerates missing. Structure is verifier-owned:
+    #   single: {"verdict": ..., "confidence": ..., ...}
+    #   double: {"verifier_a": ..., "verifier_b": ..., "adjudicated": ...}
+    verification: dict = field(default_factory=dict)
 
     VALID_STATUSES = ("suspected", "confirmed", "exploited", "retracted")
 
@@ -35,6 +42,7 @@ class Finding:
             "severity": self.severity,
             "status": self.status,
             "superseded_by": self.superseded_by,
+            "verification": self.verification,
         }
 
     @classmethod
@@ -51,6 +59,7 @@ class Finding:
             severity=data.get("severity", "info"),
             status=status,
             superseded_by=data.get("superseded_by", ""),
+            verification=data.get("verification") or {},
         )
 
     def evidence_chain(self) -> str:

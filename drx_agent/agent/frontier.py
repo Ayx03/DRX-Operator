@@ -54,6 +54,7 @@ class Intent:
     evidence: tuple[str, ...] = ()
     actor: str = "master"
     spawned_from: str | None = None
+    stage: str = "recon"
     result: str = ""
     resolved_by: str | None = None
 
@@ -102,6 +103,7 @@ class Frontier:
         evidence: tuple[str, ...] = (),
         actor: str = "master",
         spawned_from: str | None = None,
+        stage: str = "recon",
     ) -> str | None:
         hypothesis = (hypothesis or "").strip()[:200]
         action = (action or "").strip()[:200]
@@ -132,6 +134,7 @@ class Frontier:
             evidence=tuple(evidence),
             actor=actor[:60],
             spawned_from=spawned_from,
+            stage=stage,
         )
         for dep in depends_on:
             self._enabled_by.setdefault(dep, []).append(iid)
@@ -277,6 +280,15 @@ class Frontier:
         items.sort(key=lambda i: (i.priority, i.budget.created_ts))
         return items
 
+    def list_open_for_stage(self, stage: str) -> list[Intent]:
+        """Open intents belonging to `stage` only (master dispatches per stage)."""
+        items = [
+            i for i in self._intents.values()
+            if i.status is IntentStatus.OPEN and i.stage == stage
+        ]
+        items.sort(key=lambda i: (i.priority, i.budget.created_ts))
+        return items
+
     def dead_ends(self) -> list[DeadEnd]:
         return list(self._dead_ends)
 
@@ -410,6 +422,7 @@ class Frontier:
                     "evidence": list(i.evidence),
                     "actor": i.actor,
                     "spawned_from": i.spawned_from,
+                    "stage": i.stage,
                     "result": i.result,
                     "resolved_by": i.resolved_by,
                 }
@@ -451,6 +464,7 @@ class Frontier:
                 evidence=tuple(raw.get("evidence") or ()),
                 actor=raw.get("actor", "master"),
                 spawned_from=raw.get("spawned_from"),
+                stage=raw.get("stage", "recon"),
                 result=raw.get("result", ""),
                 resolved_by=raw.get("resolved_by"),
             )
