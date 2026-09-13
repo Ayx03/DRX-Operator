@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 
 def _build_one_provider(spec: dict):
     
-    provider_name = (spec.get("provider") or "").lower()
+    provider_name = (
+        os.environ.get("DRX_LLM_PROVIDER") or spec.get("provider") or ""
+    ).lower()
     is_exo = provider_name in ("exo", "qwen_exo", "qwen-exo")
 
     if provider_name in ("anthropic", "claude"):
