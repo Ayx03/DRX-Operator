@@ -24,6 +24,8 @@ from drx_agent.engine.script_library import ScriptLibrary
 from drx_agent.skills.registry import SkillsRegistry
 from drx_agent.session.manager import SessionManager
 from drx_agent.agent.frontier import Frontier
+from drx_agent.agent.handoff import Handoff
+from drx_agent.agent.stage import StageMachine
 from drx_agent.llm.base import LLMConfig
 from drx_agent.mcp.manager import MCPManager
 from drx_agent.hooks.manager import HookManager
@@ -34,11 +36,14 @@ logger = logging.getLogger(__name__)
 def _build_one_provider(spec: dict):
     
     provider_name = (spec.get("provider") or "").lower()
+    is_exo = provider_name in ("exo", "qwen_exo", "qwen-exo")
 
     if provider_name in ("anthropic", "claude"):
         env_key = os.environ.get("ANTHROPIC_API_KEY")
     elif provider_name in ("openai",):
         env_key = os.environ.get("OPENAI_API_KEY")
+    elif is_exo:
+        env_key = ""
     else:
         env_key = os.environ.get("DEEPSEEK_API_KEY")
     api_key = (
@@ -46,9 +51,15 @@ def _build_one_provider(spec: dict):
         or env_key
         or spec.get("api_key", "")
     )
-    if not api_key:
+    # Local EXO servers are unauthenticated by default, so an empty key is
+    # valid for them; every other provider keeps the existing empty-key skip.
+    if not api_key and not is_exo:
         logger.warning("Provider %r has no API key — skipped", provider_name or "default")
         return None
+
+    api_interface = (os.environ.get("DRX_LLM_INTERFACE") or "").strip().lower()
+    if api_interface not in ("chat", "responses"):
+        api_interface = "chat"
 
     config = LLMConfig(
         model=os.environ.get("DRX_LLM_MODEL") or spec.get("model", "deepseek-chat"),
@@ -56,6 +67,7 @@ def _build_one_provider(spec: dict):
         base_url=os.environ.get("DRX_LLM_BASE_URL") or spec.get("base_url", ""),
         temperature=float(spec.get("temperature", 0.7)),
         max_tokens=int(spec.get("max_tokens", 4096)),
+        api_interface=api_interface,
     )
     try:
         if provider_name in ("anthropic", "claude"):
@@ -64,6 +76,25 @@ def _build_one_provider(spec: dict):
         if provider_name in ("openai",):
             from drx_agent.llm.openai_provider import OpenAIProvider
             return OpenAIProvider(config)
+        if is_exo:
+            from drx_agent.llm.exo_provider import EXOProvider
+            # Optional startup hint only: if DRX_EXO_INGEST_PATHS is set, name the
+            # project files that WOULD be ingested into long-term knowledge. No
+            # network I/O happens here — ingestion is deferred to the caller.
+            _ingest_paths = os.environ.get("DRX_EXO_INGEST_PATHS", "").strip()
+            if _ingest_paths:
+                _paths = [p.strip() for p in _ingest_paths.split(",") if p.strip()]
+                if _paths:
+                    logger.info(
+                        "EXO knowledge ingestion requested at startup "
+                        "(deferred, no I/O now): %s",
+                        ", ".join(_paths),
+                    )
+            control_url = (
+                spec.get("control_url")
+                or os.environ.get("DRX_EXO_CONTROL_URL", "")
+            )
+            return EXOProvider(config, control_url=control_url)
         from drx_agent.llm.deepseek_provider import DeepSeekProvider
         return DeepSeekProvider(config)
     except Exception as exc:
@@ -304,6 +335,12 @@ class DrxAgent:
                     mode=getattr(self.master, 'mode', 'act'),
                     session_usage=getattr(self.master, 'session_usage', {}),
                     frontier=getattr(self.master, 'frontier', Frontier()).to_dict(),
+                    handoff=(
+                        getattr(self.master, 'handoff', None).to_dict()
+                        if getattr(self.master, 'handoff', None) is not None
+                        else None
+                    ),
+                    stage=getattr(self.master, 'stage_machine', StageMachine()).to_dict(),
                 )
                 self.event_bus.publish(Event(
                     type=EventType.AGENT_MESSAGE,
@@ -348,6 +385,13 @@ class DrxAgent:
                     restored.get("frontier") or {}
                 )
                 self.master.frontier.rebase_budgets()
+                raw_handoff = restored.get("handoff") or {}
+                self.master.handoff = (
+                    Handoff.from_dict(raw_handoff) if raw_handoff else None
+                )
+                self.master.stage_machine = StageMachine.from_dict(
+                    restored.get("stage") or {}
+                )
                 self.master.mode = restored.get("mode", "act") or "act"
                 if restored.get("session_usage"):
                     self.master.session_usage.update(restored["session_usage"])

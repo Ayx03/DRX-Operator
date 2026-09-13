@@ -25,6 +25,10 @@ class LLMConfig:
     base_url: str = ""
     temperature: float = 0.7
     max_tokens: int = 4096
+    # Which OpenAI-style API the model endpoint speaks: "chat" (chat/completions)
+    # or "responses" (v1/responses). Providers that only speak one interface
+    # ignore this; it exists for routing where both are possible.
+    api_interface: str = "chat"
 
 class LLMProvider(ABC):
     @abstractmethod
