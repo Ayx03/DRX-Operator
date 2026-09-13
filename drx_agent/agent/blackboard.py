@@ -1,6 +1,6 @@
 """Shared operational blackboard — the war-room board all agents read and write.
 
-Stigmergic coordination surface (inspired by strix / swarm blackboards):
+Shared coordination surface — a stigmergic board the whole team reads and writes:
 - Master and every sub-agent see the board; every agent can write entries.
 - Sections carry different information types so readers can scan fast.
 - Dead-end entries persist so no agent repeats a failed path.

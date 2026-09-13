@@ -1,7 +1,7 @@
 """MCPManager — load MCP server configs, spawn clients, surface tools.
 
 Tools from MCP servers are exposed to the LLM with a `mcp__<server>__<tool>`
-name prefix (matching the Claude Code convention) so they live in the same
+name prefix so they live in the same
 flat OpenAI-format tool list as built-in tools.
 """
 

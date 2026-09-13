@@ -1,4 +1,4 @@
-"""Anthropic Claude provider with streaming + tool_use support.
+"""Anthropic provider with streaming + tool_use support.
 
 Converts between OpenAI-format tool schemas/messages and Anthropic's
 tool_use content blocks so the agent keeps one canonical format."""

@@ -2,7 +2,7 @@ TAIL_SENTINEL = -1
 
 
 class ScrollState:
-    """Flat Line-Offset Scroll — reference: DeepSeek-TUI scrolling.rs"""
+    """Flat line-offset scroll; offset ``-1`` pins the view to the tail."""
 
     def __init__(self):
         self._offset: int = TAIL_SENTINEL
