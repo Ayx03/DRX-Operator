@@ -1,16 +1,18 @@
-"""Command palette screen — browse & run slash commands (Ctrl+K)."""
+"""Searchable command picker. Parameterized commands return an editable draft."""
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.screen import Screen
-from textual.widgets import Header, OptionList, Static
+from textual.containers import Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from drx_agent.event_bus import Event, EventBus, EventType
 
 
-class CommandPalette(Screen[None]):
-    """Slash-command picker (Ctrl+K). Enter runs the highlighted command."""
+class CommandPalette(ModalScreen[str | None]):
+    """Search descriptions or command names, then explicitly choose with Enter."""
 
     SLASH_COMMANDS: list[tuple[str, str]] = [
         ("/scan", "启动侦察扫描"),
@@ -33,29 +35,46 @@ class CommandPalette(Screen[None]):
         ("/help", "显示命令帮助"),
     ]
 
+    PARAMETER_COMMANDS = frozenset({"/scan", "/exploit", "/target"})
+
     BINDINGS = [
-        Binding("escape", "pop_screen", "返回", show=True),
+        Binding("escape", "pop_screen", "返回", show=False),
+        Binding("up", "select_previous", "上一条", show=False, priority=True),
+        Binding("down", "select_next", "下一条", show=False, priority=True),
     ]
 
     DEFAULT_CSS = """
     CommandPalette {
-        background: $surface;
+        align: center middle;
+        background: #0b1020 85%;
+    }
+    CommandPalette #palette-dialog {
+        width: 92%;
+        max-width: 80;
+        height: 85%;
+        max-height: 26;
+        background: #111a2c;
+        border: round #26354b;
+        padding: 0 1;
     }
     CommandPalette #palette-title {
-        height: 1;
-        padding: 0 1;
+        height: 2;
+        content-align: left middle;
+        color: #53d7c3;
         text-style: bold;
-        background: $boost;
+    }
+    CommandPalette #palette-search {
+        height: 3;
+        margin-bottom: 1;
     }
     CommandPalette #palette-list {
         height: 1fr;
-        padding: 0 1;
+        border: none;
+        background: #111a2c;
     }
     CommandPalette #palette-hint {
-        height: 1;
-        padding: 0 1;
-        color: $text-muted;
-        background: $boost;
+        height: 2;
+        color: #92a4bb;
     }
     """
 
@@ -64,29 +83,79 @@ class CommandPalette(Screen[None]):
         self.event_bus = event_bus
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static("命令面板 — 选择要执行的命令", id="palette-title")
-        yield OptionList(id="palette-list")
-        yield Static("↑/↓ 选择 · Enter 执行 · Esc 返回", id="palette-hint")
+        with Vertical(id="palette-dialog"):
+            yield Static("命令", id="palette-title", markup=False)
+            yield Input(placeholder="搜索命令或说明…", id="palette-search")
+            yield OptionList(id="palette-list")
+            yield Static(id="palette-hint", markup=False)
 
     def on_mount(self) -> None:
+        self._filter_commands("")
+        self.query_one("#palette-search", Input).focus()
+
+    def on_screen_resume(self) -> None:
+        if self.is_mounted:
+            self.query_one("#palette-search", Input).value = ""
+            self._filter_commands("")
+            self.query_one("#palette-search", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "palette-search":
+            self._filter_commands(event.value)
+
+    def _filter_commands(self, query: str) -> None:
+        terms = query.casefold().split()
         palette = self.query_one("#palette-list", OptionList)
+        palette.clear_options()
         for cmd, desc in self.SLASH_COMMANDS:
-            palette.add_option(Option(f"{cmd}  ·  {desc}", id=cmd))
-        palette.highlighted = 0
-        palette.focus()
+            if all(term in f"{cmd} {desc}".casefold() for term in terms):
+                suffix = " · 填入参数" if cmd in self.PARAMETER_COMMANDS else ""
+                palette.add_option(Option(Text(f"{cmd}  {desc}{suffix}"), id=cmd))
+        palette.highlighted = 0 if palette.option_count else None
+        self.query_one("#palette-hint", Static).update(
+            f"{palette.option_count} 个命令 · ↑↓ 选择 · Enter 确认 · Esc 返回"
+            if palette.option_count else "无匹配命令 · 修改关键词或 Esc 返回"
+        )
+
+    def action_select_previous(self) -> None:
+        self._move_selection(-1)
+
+    def action_select_next(self) -> None:
+        self._move_selection(1)
+
+    def _move_selection(self, delta: int) -> None:
+        palette = self.query_one("#palette-list", OptionList)
+        if palette.option_count:
+            palette.highlighted = ((palette.highlighted or 0) + delta) % palette.option_count
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "palette-search":
+            event.stop()
+            palette = self.query_one("#palette-list", OptionList)
+            if palette.highlighted is not None:
+                cmd = palette.get_option_at_index(palette.highlighted).id
+                if cmd:
+                    self._choose_command(cmd)
 
     def action_pop_screen(self) -> None:
         """Esc — return to the previous screen without running a command."""
-        self.dismiss()
+        self.dismiss(None)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        cmd = event.option.id
-        if cmd:
+        event.stop()
+        if event.option.id:
+            self._choose_command(event.option.id)
+
+    def _choose_command(self, cmd: str) -> None:
+        if cmd in self.PARAMETER_COMMANDS:
+            self.dismiss(cmd + " ")
+        else:
             self._execute_command(cmd)
-        self.dismiss()
+            self.dismiss(None)
 
     def _execute_command(self, cmd: str) -> None:
+        if cmd in self.PARAMETER_COMMANDS:
+            return
         if cmd == "/save":
             self.event_bus.publish(Event(type=EventType.SESSION_SAVE, data={}))
         elif cmd == "/resume":

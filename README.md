@@ -54,7 +54,7 @@ DRX-Operator includes built-in Python/Bash sandboxes, persistent shell session m
 
 **Seven-Layer Context Compaction Pipeline** — From L1 (automatic archival of large tool outputs) through L7 (cross-Agent artifact sharing), enabling tens of thousands of interaction turns within a single session without exceeding the model's context window.
 
-**Terminal Interface (Textual TUI)** — A four-region interface consisting of a chat panel, sidebar (task board + SubAgent status), input composer, and status bar. Press `Ctrl+S` to interrupt the current task.
+**Terminal Interface (Textual TUI)** — A responsive workspace with searchable commands and conversation history, lossless tool-output views, a scrollable task/Agent dashboard, draft-preserving input history, and live usage metrics. Press `Ctrl+S` to interrupt the current task.
 
 ---
 
@@ -185,12 +185,35 @@ python -m drx_agent.main
 
 ### Interface Layout
 
-After launching DRX-Operator, the Textual TUI is divided into four regions:
+The workspace uses a dark navy theme with teal accents and explicit status labels:
 
-* **Chat Panel** (main area on the left): displays Agent reasoning, tool-call cards, and results
-* **Sidebar** (right): shows the todo task list at the top and active SubAgent status below
-* **Input Composer** (bottom): accepts natural-language instructions and slash commands
-* **Status Bar** (bottom-most): displays current system status
+* **Toolbar**: opens commands, conversation records, and the task dashboard; the Stop button interrupts the current task.
+* **Conversation**: separates user messages, Agent reasoning, tool calls, errors, and approval requests. Tools can be expanded individually or together; **完整输出** opens the untruncated result for scrolling and copying.
+* **Dashboard**: shows session status, task progress, and Agent activity. Active work appears first; recent completed work is bounded. Below 100 terminal columns the dashboard is hidden by default; `Ctrl+B` switches between the full-width dashboard and conversation. Explicit visibility choices survive resizing.
+* **Composer and status bar**: keep input, operating mode, cost, and token usage visible. Optional metrics are omitted when space is tight rather than clipping the essential fields.
+
+Scrolling up suspends automatic following. New or updated messages are counted by **回到最新**; clicking it or pressing `Ctrl+L` returns to the latest output and resumes following.
+
+### Keyboard and Navigation
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+K` / `F1` | Search command names and descriptions; use arrows and Enter to choose |
+| `Ctrl+T` | Search the user/Agent conversation; copy the complete conversation independently of the current filter |
+| `Ctrl+B` | Toggle the task/Agent dashboard |
+| `Ctrl+L` | Return to the latest conversation output |
+| `F2` | Open live usage and activity metrics; the status indicator also supports click, Enter, and Space |
+| `Ctrl+S` | Interrupt the current task |
+| `Up` / `Down` in the composer | Browse input history and return to the unsent draft |
+| `Tab` after a slash-command prefix | Cycle matching command completions |
+| `Esc` | Close a dialog, or restore a draft displaced by history/completion/command selection |
+| `Ctrl+Shift+A` | Copy the latest Agent reply |
+| `Ctrl+Shift+T` | Copy the full session record |
+| `Cmd+C` / `Ctrl+Shift+C` | Copy selected text |
+
+Selecting `/scan`, `/exploit`, or `/target` in the command picker fills the composer without executing an incomplete command. Add the target and press Enter yourself.
+
+Approval cards identify the request, Agent, operation, target, and risk level, then show the resolved outcome. While approval is pending, history, completion, and command prefill cannot replace the approval input. Approval replies are excluded from input history; resolving a request restores the previous draft. L4 operations still require the exact confirmation phrase.
 
 ### Basic Interaction
 

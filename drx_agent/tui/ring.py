@@ -1,19 +1,23 @@
-"""Bottom-right ring status indicator + secondary metrics menu."""
+"""Lifecycle-driven activity indicator and live, keyboard-accessible metrics."""
 
-import time
+from typing import Any
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Container
+from textual.containers import Container, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.timer import Timer
+from textual.widgets import Button, Static
 
 from drx_agent.event_bus import EventBus, EventType, Event
 
-_SPIN_FRAMES = ("◐", "◓", "◑", "◒")
+_SPIN_FRAMES = ("|", "/", "-", "\\")
 
 
-def _fmt_tokens(n: int) -> str:
+def _fmt_tokens(n: int | None) -> str:
+    if n is None:
+        return "未上报"
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"
     if n >= 1_000:
@@ -22,129 +26,233 @@ def _fmt_tokens(n: int) -> str:
 
 
 class RingIndicator(Static):
-    """Bottom-right circular status ring; click opens the metrics menu."""
+    """Unfinished streams, tool calls and workers are the sole busy signal."""
 
     can_focus = True
-
+    BINDINGS = [
+        Binding("enter,space", "show_metrics", "运行指标", show=False),
+    ]
     DEFAULT_CSS = """
     RingIndicator {
         width: 3;
         height: 1;
-        background: $surface;
-        color: #58a6ff;
+        text-align: center;
+        background: #111a2c;
+        color: #53d7c3;
     }
+    RingIndicator:focus { background: #17243a; text-style: bold reverse; }
     """
 
+    class BusEvent(Message):
+        def __init__(self, event: Event) -> None:
+            super().__init__()
+            self.event = event
+
     def __init__(self, event_bus: EventBus):
-        super().__init__("○")
+        super().__init__("o", markup=False)
         self.event_bus = event_bus
         self._frame = 0
         self._busy = False
-        self._last_activity = 0.0
-        self._metrics: dict = {
-            "cache_hits": 0,
-            "tokens_in": 0,
-            "tokens_out": 0,
-            "tokens_total": 0,
-            "cost": "$0.0000",
-            "requests": 0,
-            "rate": 0,
+        self._timer: Timer | None = None
+        self._streams: set[tuple[str, str]] = set()
+        self._tools: set[tuple[str, str, str]] = set()
+        self._workers: set[str] = set()
+        self._metrics: dict[str, Any] = {
+            "cache_hits": None,
+            "tokens_in": None,
+            "tokens_out": None,
+            "tokens_total": None,
+            "cost": None,
+            "requests": None,
+            "rate": None,
             "mode": "act",
+            "streams": 0,
+            "tools": 0,
+            "workers": 0,
         }
+        self._event_types = (
+            EventType.STATUS_UPDATE, EventType.AGENT_MESSAGE,
+            EventType.TOOL_CALL, EventType.TOOL_RESULT,
+            EventType.SUB_AGENT_DISPATCH, EventType.SUB_AGENT_RESULT,
+        )
+        self.tooltip = "运行指标 · Enter / Space"
 
     def on_mount(self) -> None:
-        self.event_bus.subscribe(EventType.STATUS_UPDATE, self._on_status)
-        self.event_bus.subscribe(EventType.AGENT_MESSAGE, self._on_agent_msg)
-        self.event_bus.subscribe(EventType.TOOL_CALL, self._on_activity)
-        self.event_bus.subscribe(EventType.TOOL_RESULT, self._on_activity)
-        self.set_interval(0.25, self._tick)
+        for event_type in self._event_types:
+            self.event_bus.subscribe(event_type, self._receive_event)
+        self._timer = self.set_interval(0.25, self._tick)
+
+    def on_unmount(self) -> None:
+        for event_type in self._event_types:
+            self.event_bus.unsubscribe(event_type, self._receive_event)
+        if self._timer is not None:
+            self._timer.stop()
+
+    def _receive_event(self, event: Event) -> None:
+        self.post_message(self.BusEvent(event))
+
+    def on_ring_indicator_bus_event(self, message: BusEvent) -> None:
+        message.stop()
+        event = message.event
+        if event.type == EventType.STATUS_UPDATE:
+            self._on_status(event)
+        elif event.type == EventType.AGENT_MESSAGE:
+            self._on_agent_msg(event)
+        else:
+            self._on_activity(event)
 
     def _on_status(self, event: Event) -> None:
-        data = event.data
-        for k in (
+        for key in (
             "cache_hits", "tokens_in", "tokens_out", "tokens_total",
             "cost", "requests", "rate", "mode",
         ):
-            if k in data:
-                self._metrics[k] = data[k]
-        if "text" in data:
-            self._last_activity = time.time()
-            self._busy = True
+            if key in event.data:
+                self._metrics[key] = event.data[key]
 
     def _on_agent_msg(self, event: Event) -> None:
-        if event.data.get("streaming"):
-            self._last_activity = time.time()
-            if event.data.get("final"):
-                self._busy = False
-            else:
-                self._busy = True
+        data = event.data
+        if not data.get("streaming"):
+            return
+        key = (str(data.get("agent_id") or ""), str(data.get("stream_id") or "default"))
+        if data.get("final"):
+            self._streams.discard(key)
+        else:
+            self._streams.add(key)
+        self._sync_activity()
+
+    @staticmethod
+    def _tool_key(data: dict[str, Any]) -> tuple[str, str, str]:
+        owner = str(data.get("agent_id") or "")
+        for field in ("call_seq", "tool_call_id", "script_num"):
+            if data.get(field) is not None:
+                return owner, field, str(data[field])
+        return owner, "tool", str(data.get("tool") or "unknown")
 
     def _on_activity(self, event: Event) -> None:
-        self._last_activity = time.time()
-        self._busy = True
+        if event.type == EventType.TOOL_CALL:
+            if event.data.get("status") not in {"done", "completed", "error", "timeout", "cancelled"}:
+                self._tools.add(self._tool_key(event.data))
+        elif event.type == EventType.TOOL_RESULT:
+            self._tools.discard(self._tool_key(event.data))
+        elif event.type == EventType.SUB_AGENT_DISPATCH:
+            self._workers.add(str(event.data.get("agent_id") or "unknown"))
+        elif event.type == EventType.SUB_AGENT_RESULT:
+            self._workers.discard(str(event.data.get("agent_id") or "unknown"))
+        self._sync_activity()
+
+    def _sync_activity(self) -> None:
+        self._busy = bool(self._streams or self._tools or self._workers)
+        self._metrics.update(streams=len(self._streams), tools=len(self._tools), workers=len(self._workers))
+        self.tooltip = (
+            f"流 {len(self._streams)} · 工具 {len(self._tools)} · Agent {len(self._workers)}"
+            " · Enter 查看指标"
+        )
+        if not self._busy:
+            self.update("o")
 
     def _tick(self) -> None:
         if self._busy:
-            if time.time() - self._last_activity > 5:
-                self._busy = False
-                self.update("○")
-                return
             self._frame = (self._frame + 1) % len(_SPIN_FRAMES)
             self.update(_SPIN_FRAMES[self._frame])
-        else:
-            self.update("○")
+
+    def action_show_metrics(self) -> None:
+        if not isinstance(self.app.screen, MetricsScreen):
+            self.app.push_screen(MetricsScreen(self._metrics))
 
     def on_click(self, event) -> None:
-        self.app.push_screen(MetricsScreen(self._metrics))
+        event.stop()
+        self.focus()
+        self.action_show_metrics()
 
 
-class MetricsScreen(ModalScreen):
-    """Secondary menu: cache hit rate + token usage + cost."""
+class MetricsScreen(ModalScreen[None]):
+    """A scrollable live view of reported usage and observed active work."""
 
     BINDINGS = [
-        Binding("escape", "app.pop_screen", "关闭"),
-        Binding("q", "app.pop_screen", "关闭"),
+        Binding("escape", "close", "关闭"),
+        Binding("q", "close", "关闭", show=False),
     ]
-
     DEFAULT_CSS = """
-    MetricsScreen {
-        align: center middle;
+    MetricsScreen { align: center middle; }
+    #metrics-dialog {
+        width: 90%;
+        max-width: 64;
+        height: 85%;
+        max-height: 28;
+        border: round #26354b;
+        background: #111a2c;
+        color: #e7edf7;
+        padding: 0 1;
     }
-    MetricsScreen > Container {
-        width: 46;
-        height: auto;
-        border: round #30363d;
-        background: $surface;
-        padding: 1 2;
-    }
+    #metrics-title { height: 2; color: #53d7c3; text-style: bold; }
+    #metrics-scroll { height: 1fr; overflow-x: hidden; }
+    #metrics-body { width: 1fr; height: auto; }
+    #metrics-close { width: 100%; min-width: 0; height: 3; }
     """
 
-    def __init__(self, metrics: dict):
+    def __init__(self, metrics: dict[str, Any]):
         super().__init__()
+        # Share the indicator's dictionary: it is only mutated on the UI thread.
         self._metrics = metrics
+        self._last_text = ""
+        self._timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
-        yield Container(Static(self._build_metrics_text(), id="metrics-body"))
+        with Container(id="metrics-dialog"):
+            yield Static("运行指标", id="metrics-title", markup=False)
+            with VerticalScroll(id="metrics-scroll"):
+                yield Static(self._build_metrics_text(), id="metrics-body", markup=False)
+            yield Button("关闭 (Esc)", id="metrics-close")
+
+    def on_mount(self) -> None:
+        self.query_one("#metrics-scroll", VerticalScroll).focus()
+        self._refresh_metrics()
+        self._timer = self.set_interval(0.25, self._refresh_metrics)
+
+    def on_unmount(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+
+    def _refresh_metrics(self) -> None:
+        text = self._build_metrics_text()
+        if text != self._last_text:
+            self.query_one("#metrics-body", Static).update(text)
+            self._last_text = text
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "metrics-close":
+            event.stop()
+            self.action_close()
 
     def _build_metrics_text(self) -> str:
-        m = self._metrics
+        metrics = self._metrics
+        tokens_in = metrics.get("tokens_in")
+        cache_hits = metrics.get("cache_hits")
         hit_pct = (
-            (m["cache_hits"] / m["tokens_in"] * 100.0)
-            if m["tokens_in"] else 0.0
+            f"{cache_hits / tokens_in * 100:.1f}%"
+            if cache_hits is not None and tokens_in else "未提供可计算用量"
         )
-        return "\n".join(
-            [
-                "运行指标",
-                f"缓存命中率: {hit_pct:.1f}%",
-                f"缓存命中: {_fmt_tokens(m['cache_hits'])} tokens",
-                f"tokens: {_fmt_tokens(m['tokens_in'])} in / "
-                f"{_fmt_tokens(m['tokens_out'])} out / "
-                f"{_fmt_tokens(m['tokens_total'])} total",
-                f"cost: {m['cost']}",
-                f"requests: {m['requests']}",
-                f"rate: {m['rate']} r/min",
-                f"mode: {m['mode']}",
-                "",
-                "[Esc/q] 关闭",
-            ]
-        )
+
+        def reported(key: str) -> str:
+            value = metrics.get(key)
+            return "未上报" if value is None else str(value)
+
+        lines = [
+            f"模式: {reported('mode')}",
+            f"运行中流: {reported('streams')}",
+            f"运行中工具: {reported('tools')}",
+            f"运行中 Agent: {reported('workers')}",
+            "",
+            f"成本: {reported('cost')}",
+            f"输入 tokens: {_fmt_tokens(tokens_in)}",
+            f"输出 tokens: {_fmt_tokens(metrics.get('tokens_out'))}",
+            f"总计 tokens: {_fmt_tokens(metrics.get('tokens_total'))}",
+            f"缓存命中: {_fmt_tokens(cache_hits)} tokens",
+            f"缓存命中率: {hit_pct}",
+            f"请求数: {reported('requests')}",
+            f"请求速率: {reported('rate')}" + (" r/min" if metrics.get("rate") is not None else ""),
+        ]
+        return "\n".join(lines)
