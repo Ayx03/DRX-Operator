@@ -16,8 +16,12 @@ Self-contained: stdlib only.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
+import math
+import time
+import uuid
 
 
 class Decision(str, Enum):
@@ -206,3 +210,226 @@ class TerminationController:
         """Short Chinese line for logs / prompt injection."""
         label = _DECISION_LABEL.get(decision, decision.value)
         return f"【终止裁决】{label}：{reason}"
+
+
+class TeamBallot:
+    """A unanimous vote over a frozen, runtime-supplied electorate.
+
+    The caller supplies authenticated actor identities; this class never derives
+    membership or votes from task completion. A negative vote still permits the
+    remaining members to be heard, but can never produce approval. Snapshots are
+    detached from internal state, and deadlines are Unix wall-clock timestamps.
+    """
+
+    HISTORY_LIMIT = 32
+    _DECISIONS = frozenset({"approve", "reject", "abstain"})
+    _TERMINAL = frozenset({"approved", "rejected", "expired", "invalidated"})
+
+    def __init__(self, timeout_s: float = 180):
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+            raise ValueError("timeout_s must be a positive finite number")
+        try:
+            timeout = float(timeout_s)
+        except OverflowError as exc:
+            raise ValueError("timeout_s must be a positive finite number") from exc
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout_s must be a positive finite number")
+        self.timeout_s = timeout
+        self._round: dict | None = None
+        self._history: list[dict] = []
+
+    @staticmethod
+    def _text(value: str, name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a nonblank string")
+        return value
+
+    @classmethod
+    def _electorate(cls, members: list[str]) -> list[str]:
+        if not isinstance(members, list) or not members:
+            raise ValueError("members must be a nonempty list of unique identities")
+        for member in members:
+            cls._text(member, "member")
+        if len(set(members)) != len(members):
+            raise ValueError("members must be a nonempty list of unique identities")
+        return list(members)
+
+    def _finish(self, status: str, reason: str) -> None:
+        assert self._round is not None
+        self._round["status"] = status
+        self._round["reason"] = reason
+        # Keep one final snapshot per round, including later invalidation.
+        self._history = [
+            item for item in self._history
+            if item["round_id"] != self._round["round_id"]
+        ]
+        self._history.append(deepcopy(self._round))
+        self._history = self._history[-self.HISTORY_LIMIT:]
+
+    def _expire(self) -> None:
+        if (
+            self._round is not None
+            and self._round["status"] == "pending"
+            and time.time() >= self._round["deadline"]
+        ):
+            self._finish("expired", "Ballot deadline elapsed before all members voted")
+
+    def open(
+        self, *, stage: str, purpose: str, proposal: str,
+        members: list[str], fingerprint: str,
+    ) -> dict:
+        self._text(stage, "stage")
+        self._text(purpose, "purpose")
+        if purpose not in {"close", "stage_advance"}:
+            raise ValueError("purpose must be close or stage_advance")
+        self._text(proposal, "proposal")
+        self._text(fingerprint, "fingerprint")
+        electorate = self._electorate(members)
+        self._expire()
+        if self._round is not None and self._round["status"] == "pending":
+            raise ValueError("A pending ballot must be explicitly invalidated before reopening")
+        deadline = time.time() + self.timeout_s
+        if not math.isfinite(deadline):
+            raise ValueError("Ballot deadline must be finite")
+        self._round = {
+            "round_id": uuid.uuid4().hex,
+            "stage": stage,
+            "purpose": purpose,
+            "proposal": proposal,
+            "members": electorate,
+            "votes": {},
+            "pending_members": list(electorate),
+            "deadline": deadline,
+            "status": "pending",
+            "reason": "Waiting for all members to vote",
+            "fingerprint": fingerprint,
+        }
+        return self.status()
+
+    def cast(self, round_id: str, actor: str, decision: str, reason: str) -> dict:
+        self._text(round_id, "round_id")
+        self._text(actor, "actor")
+        self._text(decision, "decision")
+        self._text(reason, "reason")
+        if decision not in self._DECISIONS:
+            raise ValueError("decision must be approve, reject, or abstain")
+        if self._round is None or round_id != self._round["round_id"]:
+            raise ValueError("Unknown or stale ballot round")
+        self._expire()
+        if self._round["status"] != "pending":
+            raise ValueError("Ballot is no longer pending")
+        if actor not in self._round["members"]:
+            raise ValueError("Actor is not a member of this ballot")
+        vote = {"decision": decision, "reason": reason}
+        previous = self._round["votes"].get(actor)
+        if previous is not None:
+            if previous == vote:
+                return self.status()
+            raise ValueError("Actor has already voted in this round")
+        self._round["votes"][actor] = vote
+        self._round["pending_members"].remove(actor)
+        if not self._round["pending_members"]:
+            unanimous = all(
+                item["decision"] == "approve"
+                for item in self._round["votes"].values()
+            )
+            self._finish(
+                "approved" if unanimous else "rejected",
+                "All members approved" if unanimous
+                else "At least one member rejected or abstained",
+            )
+        return self.status()
+
+    def status(self, fingerprint: str | None = None) -> dict:
+        if fingerprint is not None:
+            self._text(fingerprint, "fingerprint")
+        self._expire()
+        if (
+            self._round is not None
+            and fingerprint is not None
+            and fingerprint != self._round["fingerprint"]
+            and self._round["status"] != "invalidated"
+        ):
+            self.invalidate("Task fingerprint changed")
+        if self._round is None:
+            return {
+                "round_id": None, "stage": None, "purpose": None,
+                "proposal": None, "members": [], "votes": {},
+                "pending_members": [], "deadline": None, "status": "idle",
+                "reason": "No ballot has been opened", "fingerprint": None,
+            }
+        return deepcopy(self._round)
+
+    def invalidate(self, reason: str) -> None:
+        self._text(reason, "reason")
+        if self._round is not None and self._round["status"] != "invalidated":
+            self._finish("invalidated", reason)
+
+    def to_dict(self) -> dict:
+        self._expire()
+        return {
+            "timeout_s": self.timeout_s,
+            "round": deepcopy(self._round),
+            "history": deepcopy(self._history),
+        }
+
+    @classmethod
+    def _restore_round(cls, data: dict) -> dict:
+        """Reject malformed persisted state rather than restoring false approval."""
+        if not isinstance(data, dict):
+            raise ValueError("Serialized ballot round must be a dictionary")
+        for name in ("round_id", "stage", "purpose", "proposal", "fingerprint", "reason"):
+            cls._text(data.get(name), name)
+        if data["purpose"] not in {"close", "stage_advance"}:
+            raise ValueError("purpose must be close or stage_advance")
+        members = cls._electorate(data.get("members"))
+        deadline = data.get("deadline")
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+        ):
+            raise ValueError("Serialized ballot deadline must be finite")
+        votes = data.get("votes")
+        if not isinstance(votes, dict):
+            raise ValueError("Serialized ballot votes must be a dictionary")
+        for actor, vote in votes.items():
+            if actor not in members or not isinstance(vote, dict):
+                raise ValueError("Serialized ballot contains an invalid voter")
+            cls._text(vote.get("decision"), "decision")
+            if vote["decision"] not in cls._DECISIONS:
+                raise ValueError("decision must be approve, reject, or abstain")
+            cls._text(vote.get("reason"), "reason")
+        pending = [member for member in members if member not in votes]
+        if data.get("pending_members") != pending:
+            raise ValueError("Serialized pending members do not match votes")
+        status = data.get("status")
+        if not isinstance(status, str) or status not in cls._TERMINAL | {"pending"}:
+            raise ValueError("Invalid serialized ballot status")
+        unanimous = not pending and all(v["decision"] == "approve" for v in votes.values())
+        if (
+            (status == "pending" and not pending)
+            or (status == "approved" and not unanimous)
+            or (status == "rejected" and (pending or unanimous))
+            or (status == "expired" and not pending)
+        ):
+            raise ValueError("Serialized ballot status does not match votes")
+        return deepcopy(data)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TeamBallot:
+        if not isinstance(data, dict):
+            raise ValueError("Serialized ballot must be a dictionary")
+        ballot = cls(timeout_s=data.get("timeout_s", 180))
+        history = data.get("history", [])
+        if not isinstance(history, list):
+            raise ValueError("Serialized ballot history must be a list")
+        for item in history[-cls.HISTORY_LIMIT:]:
+            restored = cls._restore_round(item)
+            if restored["status"] not in cls._TERMINAL:
+                raise ValueError("Serialized ballot history must contain terminal rounds")
+            ballot._history.append(restored)
+        if data.get("round") is not None:
+            ballot._round = cls._restore_round(data["round"])
+        ballot._expire()
+        return ballot

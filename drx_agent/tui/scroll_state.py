@@ -6,7 +6,6 @@ class ScrollState:
 
     def __init__(self):
         self._offset: int = TAIL_SENTINEL
-        self._total_lines: int = 0
 
     @property
     def is_tailing(self) -> bool:
@@ -17,21 +16,20 @@ class ScrollState:
         return max(0, self._offset) if self._offset != TAIL_SENTINEL else 0
 
     def resolve_offset(self, visible_lines: int, total_lines: int) -> int:
-        self._total_lines = total_lines
-        if self._offset == TAIL_SENTINEL:
-            return max(0, total_lines - visible_lines)
-        return min(self._offset, max(0, total_lines - visible_lines))
+        max_offset = max(0, total_lines - max(0, visible_lines))
+        if self.is_tailing:
+            return max_offset
+        self._offset = min(max(0, self._offset), max_offset)
+        return self._offset
 
     def scroll_up(self, delta: int, visible_lines: int, total_lines: int) -> None:
-        if self._offset == TAIL_SENTINEL:
-            self._offset = max(0, total_lines - visible_lines)
-        self._offset = max(0, self._offset - delta)
+        self._offset = max(0, self.resolve_offset(visible_lines, total_lines) - max(0, delta))
 
     def scroll_down(self, delta: int, visible_lines: int, total_lines: int) -> None:
         if self._offset == TAIL_SENTINEL:
             return
-        max_offset = max(0, total_lines - visible_lines)
-        self._offset = min(max_offset, self._offset + delta)
+        max_offset = max(0, total_lines - max(0, visible_lines))
+        self._offset = min(max_offset, self.resolve_offset(visible_lines, total_lines) + max(0, delta))
         if self._offset >= max_offset:
             self._offset = TAIL_SENTINEL
 
@@ -48,8 +46,5 @@ class ScrollState:
         self._offset = 0
 
     def on_new_content(self, visible_lines: int, total_lines: int) -> int:
-        """Called when new content arrives; returns current offset"""
-        if self._offset == TAIL_SENTINEL:
-            return max(0, total_lines - visible_lines)
-        self._offset += 1
-        return self._offset
+        """Append-only content preserves the reader's line, unless tailing."""
+        return self.resolve_offset(visible_lines, total_lines)

@@ -2,6 +2,7 @@ import subprocess
 import shlex
 import os
 from drx_agent.engine.python_sandbox import SandboxResult
+from drx_agent.engine.process import check_cancelled, run_process_sync
 
 BLOCKED_PATTERNS = [
     "rm -rf", "rm -r", "dd ", "mkfs", "fdisk",
@@ -19,6 +20,7 @@ class BashSandbox:
     def run(self, command: str, allow_destructive: bool = False) -> SandboxResult:
         import time
         start = time.time()
+        check_cancelled()
 
         if not allow_destructive:
             cmd_lower = command.lower()
@@ -44,8 +46,8 @@ class BashSandbox:
                 pass
 
         try:
-            proc = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
+            proc = run_process_sync(
+                command, shell=True,
                 timeout=self.timeout, executable='/bin/bash',
             )
             status = "success" if proc.returncode == 0 else "error"

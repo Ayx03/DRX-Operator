@@ -23,6 +23,28 @@
       "natural_query": true
     }
   },
+  "collaboration": {
+    "batch_size": 8,
+    "max_intents": 512,
+    "scheduler": {
+      "max_concurrent": 16,
+      "max_concurrent_per_target": 4,
+      "global_qps": 8
+    },
+    "voting": {
+      "enabled": true,
+      "timeout_s": 180
+    },
+    "roles": {},
+    "memory": {
+      "enabled": true,
+      "path": ".drx/memory.json",
+      "max_entries": 1000,
+      "top_k": 5,
+      "prompt_chars": 3000,
+      "revision": ""
+    }
+  },
   "mcp": {
     "servers": {
       "_example": {

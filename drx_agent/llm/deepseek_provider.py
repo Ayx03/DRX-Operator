@@ -1,6 +1,7 @@
 """DeepSeek (OpenAI-compatible) provider with streaming + tool-call support."""
 
 import json
+from urllib.parse import urlparse
 
 from drx_agent.llm.base import (
     AgentEvent,
@@ -12,18 +13,33 @@ from drx_agent.llm.base import (
 
 
 def _extract_usage(usage_obj):
-    
+    """Preserve reported cache usage without implying support when it is absent."""
     if usage_obj is None:
         return None
+    get = usage_obj.get if isinstance(usage_obj, dict) else lambda key: getattr(usage_obj, key, None)
     out = {}
-    for attr in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        v = getattr(usage_obj, attr, None)
+    for attr in (
+        "prompt_tokens", "completion_tokens", "total_tokens",
+        "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+        "prompt_cache_write_tokens", "prompt_cache_write_5m_tokens",
+        "prompt_cache_write_1h_tokens",
+    ):
+        v = get(attr)
         if v is not None:
             out[attr] = int(v)
-    for attr in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
-        v = getattr(usage_obj, attr, None)
-        if v is not None:
-            out[attr] = int(v)
+    details = get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    if "prompt_cache_hit_tokens" not in out and cached is not None:
+        out["prompt_cache_hit_tokens"] = int(cached)
+    written = details.get("cache_write_tokens") if isinstance(details, dict) else getattr(details, "cache_write_tokens", None)
+    if "prompt_cache_write_tokens" not in out and written is not None:
+        out["prompt_cache_write_tokens"] = int(written)
+    if (
+        "prompt_cache_miss_tokens" not in out
+        and "prompt_cache_hit_tokens" in out
+        and "prompt_tokens" in out
+    ):
+        out["prompt_cache_miss_tokens"] = max(0, out["prompt_tokens"] - out["prompt_cache_hit_tokens"])
     return out or None
 
 
@@ -97,6 +113,7 @@ class DeepSeekProvider(LLMProvider):
                     "assistant_message": assistant_message,
                     "usage": usage,
                     "model": self.config.model,
+                    "provider": urlparse(str(self.client.base_url)).hostname,
                 },
             )
         except Exception as e:
@@ -174,6 +191,7 @@ class DeepSeekProvider(LLMProvider):
                 "assistant_message": assistant_message,
                 "usage": _extract_usage(usage_raw),
                 "model": self.config.model,
+                "provider": urlparse(str(self.client.base_url)).hostname,
             },
         )
 

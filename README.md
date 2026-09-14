@@ -44,17 +44,21 @@ DRX-Operator includes built-in Python/Bash sandboxes, persistent shell session m
 
 **Five-Level Safety Gating** — From L0 (reconnaissance, automatically approved) to L4 (destructive operations requiring a confirmation phrase), combined with a declarative `PermissionEngine` based on ordered glob-style `allow` / `ask` / `deny` rules, where the first matching rule takes effect.
 
-**MCP Protocol Support** — External tool servers can be integrated through the Model Context Protocol. MCP tool schemas are automatically injected into the LLM tool list and invoked using the `mcp__<server>__<tool>` naming convention.
+**MCP Protocol Support** — External tool servers integrate through the Model Context Protocol. Tools use `mcp__<server>__<tool>` names and are exposed and executable only in the `research` stage; unknown external side effects are not granted to the other stages.
 
-**Priority-Based Task Scheduling and Parallel Dispatch** — A five-level priority queue: Exploit > Recon > Lateral > Persist > Report. Supports per-target concurrency limits and global QPS controls. Each SubAgent maintains its own message history and ReAct loop, allowing multiple subtasks to run concurrently.
+**Configurable Roles and Bounded Parallel Dispatch** — 15 built-in roles, including code review, dependency/configuration audit, planning, and critical review. Roles set real prompts, tool grants, TTLs, and iteration budgets. The shipped configuration allows batches of 8, up to 16 workers globally and 4 per target, with cancellation-safe waiting and rate-limited admission.
 
-**Session Persistence** — Atomic SQLite snapshots save the knowledge base, message history, collaboration state, stage, todo list, and usage statistics together. Restore drains old execution before replacing state and requeues orphaned work without refunding consumed steps. Existing JSON-sidecar sessions remain readable.
+**Unanimous Team Ballots** — Frozen stage membership, explicit approve/reject/abstain votes, deadlines, and state-fingerprint invalidation. Completed workers are consulted through fresh model requests using their own task/result context. Unanimity is an additional completion/transition gate, never proof that a vulnerability is real.
+
+**Project-Scoped Long-Term Memory** — Persistent Playbook candidates, explicit admission, content-based lexical retrieval, provenance, revision/TTL filtering, negative memories, invalidation, and conservative duplicate consolidation. Retrieved experience is reference data, not a permanent instruction or a verified finding.
+
+**Session Persistence** — Atomic SQLite snapshots save the knowledge base, message history, collaboration state, stage, todo list, usage statistics, stage-member contexts, and ballot history together. Restore drains old execution before replacing state and requeues orphaned work without refunding consumed steps. It does not automatically replay worker actions or model votes. Existing JSON-sidecar sessions remain readable.
 
 **LLM Resilience Layer** — Exponential-backoff retries plus Provider fallback chains. HTTP 429, 5xx, and connection-related errors are retried automatically. If retries are exhausted, the system automatically switches to the next Provider, while the UI displays the failover status in real time.
 
 **Seven-Layer Context Compaction Pipeline** — From L1 (automatic archival of large tool outputs) through L7 (cross-Agent artifact sharing), enabling tens of thousands of interaction turns within a single session without exceeding the model's context window.
 
-**Terminal Interface (Textual TUI)** — A responsive workspace with searchable commands and conversation history, lossless tool-output views, a scrollable task/Agent dashboard, draft-preserving input history, and live usage metrics. Press `Ctrl+S` to interrupt the current task.
+**Terminal Interface (Textual TUI)** — A black, conversation-first workspace with a continuously rotating activity indicator, multiline editing, independent approval dialogs, searchable lossless history, an optional Agent inspector, and live usage metrics. Press `Esc` or `Ctrl+S` to interrupt work.
 
 ---
 
@@ -148,6 +152,50 @@ Supported Provider types:
 }
 ```
 
+### Configure Collaboration
+
+The top-level `collaboration` section in `configs/default_config.json` controls these features:
+
+```json
+{
+  "collaboration": {
+    "batch_size": 8,
+    "max_intents": 512,
+    "scheduler": {
+      "max_concurrent": 16,
+      "max_concurrent_per_target": 4,
+      "global_qps": 8
+    },
+    "voting": {"enabled": true, "timeout_s": 180},
+    "roles": {
+      "code_review": {"max_iterations": 20, "ttl": 600},
+      "api_contracts": {
+        "description": "Read-only API contract review",
+        "system_prompt": "Compare documented API contracts with source evidence; report mismatches.",
+        "tools": ["read_file", "grep", "read_artifact", "memory_search", "memory_get"],
+        "max_iterations": 16,
+        "ttl": 300,
+        "parallel_tool_calls": true
+      }
+    },
+    "memory": {
+      "enabled": true,
+      "path": ".drx/memory.json",
+      "max_entries": 1000,
+      "top_k": 5,
+      "prompt_chars": 3000,
+      "revision": ""
+    }
+  }
+}
+```
+
+`batch_size` must fit `max_concurrent`. Saturated targets wait without blocking unrelated targets; cancellation releases admission capacity. `global_qps` limits **worker and vote-request admission**, not every HTTP request or tool invocation. Set it to `null` to disable rate limiting while retaining concurrency caps. A full Frontier evicts terminal records only, or explicitly refuses new work when all records are unfinished.
+
+Built-in role overrides inherit omitted fields. Custom roles require `description`, `system_prompt`, and `tools`; `tools: []` grants no tools, while `null` adds no role-specific restriction. Stage, plan-mode, runtime identity, and Master-only restrictions still apply. Role TTLs must be 1–3600 seconds and iteration budgets 1–100. Roles currently share the configured provider; selecting a role does not select another model.
+
+The shipped configuration enables unanimous gating. Existing configurations without `collaboration.voting.enabled` retain the original termination policy; add `true` to opt in. Ballot collection makes one additional model request per participating worker, subject to the scheduler and deadline.
+
 ### Configure MCP Servers (Optional)
 
 Add MCP server definitions under `mcp.servers` in `configs/default_config.json`:
@@ -167,7 +215,7 @@ Add MCP server definitions under `mcp.servers` in `configs/default_config.json`:
 }
 ```
 
-When DRX-Operator starts, it automatically connects to all MCP servers with `enabled: true` and injects their tools into the LLM tool list using the following naming convention:
+At startup, DRX-Operator connects to MCP servers with `enabled: true` in the background without blocking terminal input. Connected tools become available in the `research` stage using this naming convention:
 
 ```text
 mcp__<server_name>__<tool_name>
@@ -185,35 +233,64 @@ python -m drx_agent.main
 
 ### Interface Layout
 
-The workspace uses a dark navy theme with teal accents and explicit status labels:
+The workspace uses a near-black background with warm accents, inspired by OpenCode's conversation-first layout:
 
 * **Toolbar**: opens commands, conversation records, and the task dashboard; the Stop button interrupts the current task.
-* **Conversation**: separates user messages, Agent reasoning, tool calls, errors, and approval requests. Tools can be expanded individually or together; **完整输出** opens the untruncated result for scrolling and copying.
-* **Dashboard**: shows session status, task progress, and Agent activity. Active work appears first; recent completed work is bounded. Below 100 terminal columns the dashboard is hidden by default; `Ctrl+B` switches between the full-width dashboard and conversation. Explicit visibility choices survive resizing.
-* **Composer and status bar**: keep input, operating mode, cost, and token usage visible. Optional metrics are omitted when space is tight rather than clipping the essential fields.
+* **Conversation**: shares one event-backed history with the transcript viewer. Tool titles display paths and bracketed text literally; errors expand without interpreting their contents as markup. Only a bounded window of cards and bounded message previews are rendered. Older/newer navigation retains access to history; full tool inputs and outputs open in scrollable pages, and copy actions always use the complete original text.
+* **Agent inspector**: hidden by default to leave room for conversation. `Ctrl+B` opens it; below 100 columns it replaces the conversation rather than squeezing both. Select a worker and press Enter to inspect its task, target, tools, result, or error. Large details use a bounded preview with **完整详情** for paginated inspection and **复制详情** for the full original. Visibility choices survive resizing.
+* **Activity bar**: rotates every 100 ms even before the first model token. It shows the real running/waiting/stopping phase, elapsed time, output age, and active worker/ballot counts. It stops when work finishes or cancellation cleanup completes; it does not invent a completion percentage.
+* **Composer and status bar**: a multiline editor grows within a bounded height while mode, cost, and token usage remain visible. Less important controls and metrics are hidden in narrow terminals.
 
 Scrolling up suspends automatic following. New or updated messages are counted by **回到最新**; clicking it or pressing `Ctrl+L` returns to the latest output and resumes following.
+
+### Runtime deadlines and cancellation
+
+* HTTP/search/CVE, file I/O, and regex tools run in owned helper processes with a default 30-second total deadline, rather than relying on socket inactivity timeouts. Cancellation terminates the helper and joins cleanup. FIFO/device files are rejected; pathological regex computation cannot hold the terminal's Python GIL.
+* Worker TTL covers active model calls and tool execution, not just time between turns. Expiry drains cancellation before releasing worker capacity and leases. Completed sibling tool results are retained, and interrupted calls receive matching results so the next model request has valid history.
+* Compaction uses the model-call deadline. `/dream` participates in the same stop/restore barrier as chat; `/stop` cancels active and queued requests from that session. Failed or interrupted compaction retains the previous progress document.
+* Command hooks run asynchronously with their configured timeout. In-process `HookManager.register()` now accepts only cooperative async callbacks: they must yield and propagate cancellation. Move blocking/synchronous callbacks to `register_command()`; detaching an unkillable Python thread is not supported.
+* MCP request deadlines include stdin write/drain and reply waits. Cancelling startup closes a spawned server even before it is registered. Sandbox, hook, MCP, and PTY cleanup terminates owned POSIX process groups with a short TERM grace before KILL and reaping.
+
+Deadlines trigger cancellation, not an unconditional wall-clock bound on OS cleanup. Descendants that deliberately escape the owned process group, change privileges beyond the caller's authority, or remain in uninterruptible kernel I/O cannot be guaranteed terminated; permission failures are reported. Windows process cleanup is limited to the direct child.
+
+File mutations publish through atomic replacement, preserving checked ownership/mode and available extended metadata: native ACLs, xattrs/resource forks and file flags on macOS; kernel-enumerated xattrs including ACLs on Linux. Preservation errors reject publication. macOS compressed files and resource forks over 4 GiB, and existing-file metadata preservation on other operating systems, are unsupported. Replacement creates a new inode: other hardlink aliases keep their old contents; inode identity/birthtime and Linux inode ioctl flags are not preserved. A forcibly killed writer may leave a hidden temporary file, but does not publish a partially written target.
+
+### Prompt caching and usage
+
+Master keeps policy and project instructions in a stable system prefix. Live knowledge, notes, collaboration state, and retrieved context are appended as complete snapshots only when they change; the latest snapshot supersedes older state. Worker policies precede task-specific context, without sharing private histories or identities. Compaction, explicit project-instruction reloads, and changed tool grants can legitimately invalidate a prefix.
+
+`F2` shows measured input-token cache reuse, known/unknown input coverage, missing-usage requests, and breakdowns by model and worker role (`master` and `compaction` are separate categories). `unavailable` means the provider did not supply enough data; `partial` means the ratio covers only reported input. Missing usage is not treated as zero, and token totals do not guess unreported amounts. Legacy sessions retain historical totals but their old cache/cost figures are not mixed into corrected measurements.
+
+Costs are estimates for the known-priced portion, with cached reads and writes accounted for separately where reported. Unknown models or custom endpoints are not assumed free. DeepSeek estimates use the UTC pricing tier at usage-recording time, which may differ from invoice timing. OpenAI/DeepSeek native caching is automatic; native Anthropic requests enable automatic caching, while custom Anthropic endpoints receive no unsupported cache-control extension. Provider caches remain best-effort: a stable prefix does not guarantee a hit. See [DeepSeek caching](https://api-docs.deepseek.com/guides/kv_cache) and [Anthropic caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
 ### Keyboard and Navigation
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+K` / `F1` | Search command names and descriptions; use arrows and Enter to choose |
-| `Ctrl+T` | Search the user/Agent conversation; copy the complete conversation independently of the current filter |
+| `Ctrl+P` / `F1` | Search command names and descriptions; use arrows and Enter to choose |
+| `Ctrl+T` | Search messages, full tool inputs/results, approvals, and worker records |
 | `Ctrl+B` | Toggle the task/Agent dashboard |
 | `Ctrl+L` | Return to the latest conversation output |
 | `F2` | Open live usage and activity metrics; the status indicator also supports click, Enter, and Space |
 | `Ctrl+S` | Interrupt the current task |
-| `Up` / `Down` in the composer | Browse input history and return to the unsent draft |
+| `Enter` | Send the current message |
+| `Shift+Enter` / `Ctrl+J` | Insert a newline; terminal paste preserves literal multiline text |
+| `Up` / `Down` in the composer | Browse history only at the visual top/bottom; otherwise move the cursor |
 | `Tab` after a slash-command prefix | Cycle matching command completions |
-| `Esc` | Close a dialog, or restore a draft displaced by history/completion/command selection |
+| `Esc` | Close a dialog or restore a displaced draft; otherwise interrupt the current task |
 | `Ctrl+Shift+A` | Copy the latest Agent reply |
 | `Ctrl+Shift+T` | Copy the full session record |
 | `Cmd+C` / `Ctrl+Shift+C` | Copy selected text |
 
-Selecting `/scan`, `/exploit`, or `/target` in the command picker fills the composer without executing an incomplete command. Add the target and press Enter yourself.
+Selecting `/scan`, `/exploit`, or `/target` in the command picker fills the composer without executing an incomplete command. Add the target and press Enter yourself. The picker and editor share command dispatch: `/help` displays local help without interrupting work or requesting a model response.
 
-Approval cards identify the request, Agent, operation, target, and risk level, then show the resolved outcome. While approval is pending, history, completion, and command prefill cannot replace the approval input. Approval replies are excluded from input history; resolving a request restores the previous draft. L4 operations still require the exact confirmation phrase.
+Approvals open in a separate FIFO modal showing request ID, Agent, operation, target, and risk. The editor's text and selection remain untouched. Reject is the safe default; permission prompts also offer **Always** for this session, without overriding deny rules. L4 operations require the exact phrase `I CONFIRM DESTRUCTIVE ACTION`. Stale or duplicate resolutions cannot answer another request. Only a successfully committed session restore invalidates the old UI queue; missing or invalid snapshots preserve current tasks and approvals. A covered dialog closes only after it returns to the foreground, without dismissing an unrelated window.
+ 
+In the transcript viewer, normal copy uses selected text or the current filter; **复制全部** / `Ctrl+Shift+C` copies the complete history. Large results display a bounded tail preview; search and full/filter copy still use all retained records. Streaming updates are coalesced rather than queueing a redraw for every token. This history is saved independently of compacted model context. Older snapshots import whatever message/tool history they contain; previously discarded text cannot be reconstructed.
+
+Interrupted, timed-out, or failed model streams retain the text already received. Ordinary incremental history refreshes read changed records rather than scanning all unchanged history; explicit full search and copy still process the complete retained data. In small terminals, the tool-output dialog scrolls to keep keyboard-focused controls visible.
+
+Normal exit (`Ctrl+Q`) stops new work, joins task/approval/resource cleanup, then saves the final snapshot. Cleanup may extend beyond an execution deadline. Teardown or automatic-save failures remain visible after the interface closes and produce a nonzero exit code.
 
 ### Basic Interaction
 
@@ -254,6 +331,12 @@ Generate a report summarizing the findings from this session
 | `/progress`                         | Show the progress document (9-section structure)           |
 | `/memory`                           | Show project memory (`DRX.md` / `AGENTS.md` / `CLAUDE.md`) |
 | `/memory reload`                    | Reload project memory files                                |
+| `/roles`                            | List role responsibilities, grants, and budgets             |
+| `/team`                             | Show scheduler capacity, stage members, and completion state |
+| `/vote`                             | Show ballot outcome, deadline, and missing voters           |
+| `/vote cancel`                      | Invalidate the ballot and cancel outstanding vote requests  |
+| `/memory search <query>`            | Search admitted long-term experience in this project        |
+| `/memory get <id>`                  | Read a memory record and its provenance                     |
 
 ### Plan Mode and Act Mode
 
@@ -275,8 +358,9 @@ New sessions store their complete, versioned snapshot in `sessions/sessions.db` 
 
 * Knowledge base, message history, targets, todos, mode, and usage statistics
 * Frontier, stage, handoff, Forum subscriptions/messages, IRC messages, and claims
+* Stage-member task/results, runtime identities, and ballot deadlines/votes/history
 
-Restore waits for old chat, queued dispatch, workers, and approvals to finish cancellation before replacing any state. Orphaned `claimed` intents become `open`, consumed steps are retained, callbacks are rebound, and session-only authorizations are cleared. Pending communication is preserved rather than silently marked complete.
+Restore waits for old chat, queued dispatch, workers, and approvals to finish cancellation before replacing any state. Orphaned `claimed` intents become `open`, consumed steps are retained, callbacks are rebound, and session-only authorizations are cleared. Saved nonterminal members become cancelled, not fictitious running workers. Pending communication is preserved rather than silently marked complete. The current configured frontier capacity takes precedence over the snapshot; a smaller capacity can evict terminal records but refuses restoration if it would discard unfinished work.
 
 Legacy sessions with SQLite metadata plus `sessions/<id>/messages.json` and `kb.json` can still be read. Saving again writes the new snapshot format; it does not overwrite legacy files. Corrupt or incomplete snapshots fail explicitly instead of restoring an empty session.
 
@@ -299,6 +383,14 @@ After editing these files, use:
 ```
 
 to reload them.
+
+Long-term experience is separate from those instruction files. `memory_add` writes a **candidate**; `memory_admit` requires the Master to review a source and evidence references before activating it. `memory_search` and automatic bounded prompt retrieval return only admitted, unexpired records in the current project namespace. `memory_get` also exposes candidate/rejected records for explicit review.
+
+The namespace defaults to the resolved working directory; set `collaboration.memory.project_root` for a stable project root. Relative memory paths resolve under that root. A revision-bound record is recalled only when its revision matches `collaboration.memory.revision`; an empty current revision recalls only unbound records. `expires_after` is seconds, with zero meaning no TTL. Use `memory_invalidate(source=..., revision=..., reason=...)` for exact source/old-revision selection and revalidation, or `memory_reject(id, reason)` to withdraw a record. Negative memories remain explicitly labeled and are not findings.
+
+Expiration is not renewed by reading or admitting a stale record. Revalidation after TTL expiry requires `memory_add` with fresh evidence and current scope/revision, then explicit admission of the new candidate; the old record is not silently rewritten.
+
+`memory_consolidate` merges only exact, provenance-compatible duplicates and preserves evidence references; it does not synthesize conclusions. Persistence uses atomic replacement and surfaces corruption/write errors. Capacity does not silently evict valid active knowledge. This is local lexical retrieval, not an embedding service or EXO ingestion. Use one shared in-process owner per memory file; concurrent independent processes writing the same file are not supported. `.drx/` is ignored by Git.
 
 ---
 
@@ -346,12 +438,14 @@ When a task can be decomposed into independent subtasks, the Master Agent dispat
 
 Each SubAgent:
 
-1. Has its own unique `agent_id` (for example, `recon-a1b2c3`) and independent message history
+1. Has its own unique `agent_id` (for example, `recon-a1b2c3d4e5f6`) and independent message history
 2. Uses a runtime-bound identity with the parent's tool executor; model-supplied `author`, `owner`, or `agent_id` cannot impersonate another Agent
 3. Runs its own ReAct loop with a maximum iteration count and TTL limit
 4. Publishes a `SUB_AGENT_RESULT` event through the EventBus when finished, allowing the sidebar to update in real time
 
 SubAgents cannot recursively invoke the `task` tool, preventing uncontrolled recursive Agent spawning.
+
+Choose a role with `task(description, agent_type)` or `dispatch_sub_agent(agent_type, target, task)`. `intent_batch(max_workers, agent_type, scope, priority_cap)` applies the selected role to an explicitly bounded batch. Inspect `role_list` before assigning a custom role; unknown role names fail rather than silently using a general worker. Read-only specialists cannot execute commands or write project files.
 
 ### Agent Communication and Completion
 
@@ -361,6 +455,7 @@ SubAgents cannot recursively invoke the `task` tool, preventing uncontrolled rec
 * **Orphaned IRC:** only the Master can use `irc_admin_close(message_id, reason)` when both participants are offline. The reason, original participants, and original message remain in the audit history; administrative closure is not a fabricated reply.
 * **Work ownership:** all worker dispatch paths use the same lifecycle and lease handling. Duplicate dispatch is refused; active leases are renewed and released on exit. `claim_acquire`/`claim_release` enforce worker ownership, and `team_status` reports real workers rather than forum posting history.
 * **Truth and completion:** verifier decisions update finding status and invalidate retracted dependencies. Finishing an intent does not promote its original hypothesis to fact. Stage changes refresh the next model request's tools and instructions. `request_close` checks work, coverage, validation, and unresolved or undelivered messages; a completed zero-finding investigation is valid. Budget exhaustion stops/drains execution and returns `budget_exhausted`, not `completed`.
+* **Full-electorate ballots:** after active workers, the Master's current intent, and outstanding claims finish, call `team_vote(purpose="close" | "stage_advance", proposal, decision, reason)`. The proposer explicitly casts the Master's vote, and every actual stage member gets an independent native `vote_cast` request. A rejection or abstention prevents approval; missing/error/timeout responses are never synthesized into votes. `vote_status` or `/vote` inspects the round without interrupting it; `/vote cancel` explicitly cancels it. New work, evidence, membership, claims, or unresolved communication invalidates the old state fingerprint. Stage transitions clear the old electorate. Unanimity cannot bypass the original completion checks or mark a finding verified; budget stopping remains an incomplete outcome.
 
 ### Security Model
 
@@ -408,6 +503,8 @@ Users may respond with `always` to extend a permission approval for the session,
 3. If retries are exhausted, or the error is non-transient, automatically switch to the next Fallback Provider
 4. If a streaming request fails after visible output (`text` / `tool_call`) has already been emitted, do not retry; return the error immediately to prevent duplicate output
 5. The UI displays real-time status notifications such as `"Retrying..."` and `"Switching to Provider X..."`
+
+EXO BOOST streaming stops on `response.completed`, `response.failed`, or `response.incomplete`, without waiting for connection EOF, and closes the source before reporting the terminal result. Partial text, ordered completed tool-call data, reported usage, model and finish reason survive terminal/cleanup errors and the resilient router. Failed streams never initiate tool calls or synthesize successful completion; reported failed-request usage is still counted.
 
 ---
 
@@ -478,7 +575,7 @@ Users may respond with `always` to extend a permission approval for the session,
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `todo_write`         | Create or update the todo list. Each item contains `content` + `status` (`pending`/`in_progress`/`completed`). Displayed in the sidebar |
 | `task`               | Dispatch an independent SubAgent to execute a self-contained subtask with its own message history and ReAct loop                        |
-| `dispatch_sub_agent` | Dispatch a specialized red-team SubAgent (`recon`/`exploit`/`lateral`/`persist`/`report`)                                               |
+| `dispatch_sub_agent` | Dispatch a configured specialist; prompts, tool grants, TTL and iterations come from its role profile |
 | `generate_report`    | Generate a Markdown/HTML penetration testing report from session findings. Optionally includes token/cost statistics                    |
 | `forum_post` / `forum_read` | Publish a typed thread/reply or read original messages |
 | `forum_subscribe` / `forum_pending` | Subscribe to a topic or inspect assigned unresolved questions and deadlines |
@@ -486,6 +583,12 @@ Users may respond with `always` to extend a permission approval for the session,
 | `irc_close` / `irc_admin_close` | Participant closure; Master-only audited closure of an offline pair's orphaned obligation |
 | `claim_acquire` / `claim_release` / `claim_status` | Manage owned work leases without impersonating another worker |
 | `team_status` / `request_close` | Inspect actual collaboration state or request program-level completion/budget-stop adjudication |
+| `role_list` | Inspect built-in/custom role contracts |
+| `intent_batch` | Dispatch an explicit batch with configurable size and role, respecting global/per-target admission |
+| `team_vote` / `vote_cast` / `vote_status` | Master-led full-electorate solicitation, identity-bound voting, and round inspection |
+| `memory_add` / `memory_admit` / `memory_reject` | Candidate creation and Master-only admission/withdrawal |
+| `memory_search` / `memory_get` | Project-scoped active recall and full-record inspection |
+| `memory_invalidate` / `memory_consolidate` | Source/revision revalidation and conservative exact-duplicate consolidation |
 
 ### Context Management
 

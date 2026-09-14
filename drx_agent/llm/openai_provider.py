@@ -4,6 +4,7 @@ Mirrors the DeepSeekProvider impl since DeepSeek is OpenAI-API-compatible.
 """
 
 import json
+from urllib.parse import urlparse
 
 from drx_agent.llm.base import (
     AgentEvent,
@@ -86,6 +87,7 @@ class OpenAIProvider(LLMProvider):
                     "assistant_message": assistant_message,
                     "usage": _extract_usage(getattr(response, "usage", None)),
                     "model": self.config.model,
+                    "provider": urlparse(str(self.client.base_url)).hostname,
                 },
             )
         except Exception as e:
@@ -159,6 +161,7 @@ class OpenAIProvider(LLMProvider):
                 "assistant_message": assistant_message,
                 "usage": _extract_usage(usage_raw),
                 "model": self.config.model,
+                "provider": urlparse(str(self.client.base_url)).hostname,
             },
         )
 

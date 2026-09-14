@@ -12,6 +12,8 @@ import os
 import shlex
 from typing import Any, Optional
 
+from drx_agent.engine.process import terminate_process
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,23 +48,40 @@ class MCPClient:
         self._next_id: int = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._spawn_task: Optional[asyncio.Task] = None
+        self._start_task: Optional[asyncio.Task] = None
+        self._close_task: Optional[asyncio.Task] = None
         self._closed = False
 
 
     async def start(self) -> None:
-        if self.proc is not None:
-            return
+        if self._closed:
+            raise MCPError(f"MCP server '{self.name}' closed")
+        if self._start_task is None:
+            self._start_task = asyncio.create_task(self._start())
+        try:
+            await asyncio.shield(self._start_task)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _start(self) -> None:
         spawn_env = os.environ.copy()
         spawn_env.update(self.env)
         try:
-            self.proc = await asyncio.create_subprocess_exec(
+            # Retain the spawn itself: cancellation can arrive before it returns
+            # the process handle, so close must join it before terminating.
+            self._spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(
                 *self.argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=spawn_env,
                 cwd=self.cwd,
-            )
+                start_new_session=True,
+            ))
+            self.proc = await asyncio.shield(self._spawn_task)
         except FileNotFoundError as e:
             raise MCPError(
                 f"MCP server '{self.name}' command not found: {self.argv[0]!r}"
@@ -71,7 +90,7 @@ class MCPClient:
             raise MCPError(f"MCP server '{self.name}' failed to start: {e}") from e
 
         # Drain stderr asynchronously so the server doesn't block on it.
-        asyncio.create_task(self._drain_stderr())
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._reader_task = asyncio.create_task(self._read_loop())
 
         try:
@@ -84,7 +103,6 @@ class MCPClient:
                 },
             )
         except Exception as e:
-            await self.close()
             raise MCPError(f"MCP server '{self.name}' init failed: {e}") from e
 
         self.server_info = init_result.get("serverInfo", {}) or {}
@@ -99,32 +117,46 @@ class MCPClient:
             self.tools = []
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self.proc is None:
-            return
-        try:
-            if self.proc.stdin and not self.proc.stdin.is_closing():
-                self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(self.proc.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close())
+        cancelled = False
+        while True:
             try:
-                self.proc.terminate()
-            except ProcessLookupError:
+                await asyncio.shield(self._close_task)
+                break
+            except asyncio.CancelledError:
+                if self._close_task.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close(self) -> None:
+        self._fail_pending()
+        if self._start_task is not None:
+            if not self._start_task.done():
+                self._start_task.cancel()
+            await asyncio.gather(self._start_task, return_exceptions=True)
+        if self._spawn_task is not None:
+            try:
+                self.proc = await self._spawn_task
+            except Exception:
                 pass
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                try:
-                    self.proc.kill()
-                except ProcessLookupError:
-                    pass
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
+        try:
+            if self.proc is not None:
+                if self.proc.stdin is not None:
+                    self.proc.stdin.close()
+                await terminate_process(self.proc)
+        finally:
+            tasks = [task for task in (self._reader_task, self._stderr_task) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._fail_pending()
+
+    def _fail_pending(self) -> None:
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(MCPError("server closed"))
@@ -188,7 +220,7 @@ class MCPClient:
         return self._next_id
 
     async def _send(self, payload: dict) -> None:
-        if self.proc is None or self.proc.stdin is None or self.proc.stdin.is_closing():
+        if self._closed or self.proc is None or self.proc.stdin is None or self.proc.stdin.is_closing():
             raise MCPError(f"MCP server '{self.name}' stdin closed")
         encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         self.proc.stdin.write(encoded)
@@ -198,26 +230,37 @@ class MCPClient:
             raise MCPError(f"MCP write failed: {e}") from e
 
     async def _request(self, method: str, params: dict) -> Any:
+        if self._closed:
+            raise MCPError(f"MCP server '{self.name}' closed")
         req_id = self._alloc_id()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        try:
+
+        async def send_and_receive() -> Any:
             await self._send({
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "method": method,
                 "params": params,
             })
-            return await asyncio.wait_for(fut, timeout=self.request_timeout)
+            return await fut
+
+        try:
+            return await asyncio.wait_for(send_and_receive(), timeout=self.request_timeout)
         finally:
             self._pending.pop(req_id, None)
+            if not fut.done():
+                fut.cancel()
+            elif not fut.cancelled():
+                # A server error may arrive while drain is blocked or cancelled.
+                fut.exception()
 
     async def _notify(self, method: str, params: dict) -> None:
-        await self._send({
+        await asyncio.wait_for(self._send({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
-        })
+        }), timeout=self.request_timeout)
 
     async def _read_loop(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
@@ -235,10 +278,7 @@ class MCPClient:
                 continue
             await self._dispatch(msg)
         # Stream closed — fail pending requests so callers don't hang.
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(MCPError("server closed"))
-        self._pending.clear()
+        self._fail_pending()
 
     async def _dispatch(self, msg: dict) -> None:
         if "id" in msg and ("result" in msg or "error" in msg):

@@ -16,8 +16,11 @@ stays False and no session field is ever sent to the server.
 
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import aclosing
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from drx_agent.llm.base import (
     AgentEvent,
@@ -27,6 +30,7 @@ from drx_agent.llm.base import (
     LLMProvider,
 )
 from drx_agent.llm.exo_conversions import (
+    _close_stream,
     _consume_event_stream,
     _messages_to_responses_input,
     _output_items_to_events,
@@ -121,8 +125,9 @@ class EXOProvider(LLMProvider):
                 kwargs["tool_choice"] = "auto"
 
             if stream:
-                async for ev in self._stream(kwargs):
-                    yield ev
+                async with aclosing(self._stream(kwargs)) as events:
+                    async for ev in events:
+                        yield ev
                 return
 
             response = await self.client.responses.create(**kwargs)
@@ -132,6 +137,8 @@ class EXOProvider(LLMProvider):
                 getattr(response, "usage", None),
                 self.config.model,
             ):
+                if ev.type == AgentEventType.DONE:
+                    ev.metadata["provider"] = urlparse(str(self.client.base_url)).hostname
                 yield ev
         except Exception as e:
             yield AgentEvent(type=AgentEventType.ERROR, content=str(e))
@@ -140,14 +147,25 @@ class EXOProvider(LLMProvider):
         stream = await self.client.responses.create(**kwargs, stream=True)
 
         async def _tuples():
-            async for ev in stream:
-                try:
+            source_failed = False
+            try:
+                async for ev in stream:
                     yield _sse_event_to_tuple(ev)
+            except (Exception, asyncio.CancelledError):
+                source_failed = True
+                raise
+            finally:
+                try:
+                    await _close_stream(stream)
                 except Exception:
-                    continue
+                    if not source_failed:
+                        raise
 
-        async for ev in _consume_event_stream(_tuples(), self.config.model):
-            yield ev
+        async with aclosing(_consume_event_stream(_tuples(), self.config.model)) as events:
+            async for ev in events:
+                if ev.type in (AgentEventType.DONE, AgentEventType.ERROR):
+                    ev.metadata["provider"] = urlparse(str(self.client.base_url)).hostname
+                yield ev
 
     def count_tokens(self, messages):
         return sum(len(m.get("content", "") or "") // 4 for m in messages)

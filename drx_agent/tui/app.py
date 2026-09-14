@@ -1,25 +1,29 @@
-"""DRX-Operator main TUI application — thin presentation shell over EventBus"""
+"""Conversation-first terminal shell; execution stays behind the EventBus."""
 
-import logging
+import asyncio
 import platform
 import subprocess
+from pathlib import Path
+from rich.text import Text
 
-from textual.app import App, ComposeResult, SkipAction
+from textual.actions import SkipAction
+from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal
 from textual.theme import Theme
-from textual.widgets import Button, Static
+from textual.widgets import Button, Static, TextArea
 
 from drx_agent.event_bus import EventBus, EventType, Event
+from drx_agent.tui.activity import ActivityBar
 from drx_agent.tui.chat_panel import ChatPanel
 from drx_agent.tui.sidebar import Sidebar
 from drx_agent.tui.composer import Composer
 from drx_agent.tui.footer import StatusFooter
 from drx_agent.tui.ring import RingIndicator
+from drx_agent.tui.transcript import TranscriptLog
 from drx_agent.tui.transcript_screen import TranscriptScreen
 from drx_agent.tui.command_palette import CommandPalette
-
-logger = logging.getLogger(__name__)
+from drx_agent.session.usage import restore_usage, usage_status
 
 _CLIPBOARD_COMMANDS = {
     "Darwin": ["pbcopy"],
@@ -28,11 +32,7 @@ _CLIPBOARD_COMMANDS = {
 
 
 def _copy_to_system_clipboard(text: str, _run=None) -> bool:
-    """Write text to the OS clipboard via a native tool.
-
-    Textual's built-in copy uses OSC 52, which macOS Terminal.app does not
-    support — so we fall back to pbcopy / xclip for terminals without it.
-    """
+    """Use the native clipboard where the terminal cannot handle OSC 52."""
     run = _run or subprocess.run
     command = _CLIPBOARD_COMMANDS.get(platform.system())
     if command is None:
@@ -40,15 +40,14 @@ def _copy_to_system_clipboard(text: str, _run=None) -> bool:
     try:
         run(command, input=text, text=True, check=True, timeout=5)
         return True
-    except Exception:
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return False
 
 
 class DrxAgentApp(App[None]):
-    """DRX-Operator main TUI application"""
+    """A quiet transcript, a real editor, and optional inspection surfaces."""
 
     ENABLE_COMMAND_PALETTE = False
-
     CSS = """
     Screen {
         background: $background;
@@ -56,215 +55,141 @@ class DrxAgentApp(App[None]):
         scrollbar-size: 1 1;
     }
     #workspace-header {
-        height: 3;
+        height: 1;
         padding: 0 1;
-        align-vertical: middle;
-        background: $surface;
-        border-bottom: solid #26354b;
+        background: $background;
     }
     #workspace-brand {
-        width: 1fr;
+        width: auto;
+        min-width: 5;
         height: 1;
         text-style: bold;
         color: $primary;
     }
     #workspace-context {
-        width: auto;
+        width: 1fr;
         height: 1;
-        margin-right: 2;
         color: $text-muted;
     }
-    #workspace-header Button, #conversation-header Button {
+    #workspace-header Button {
         width: auto;
-        min-width: 6;
+        min-width: 4;
         height: 1;
         min-height: 1;
         margin-left: 1;
         padding: 0 1;
         border: none;
-        background: $panel;
-        color: $text;
-    }
-    #workspace-header Button:hover, #conversation-header Button:hover {
-        background: $primary 20%;
-        color: $primary;
-    }
-    #workspace-header Button:focus, #conversation-header Button:focus {
-        text-style: bold;
-        background: $primary;
-        color: $background;
-    }
-    #workspace-header #stop-task {
-        color: $error;
-    }
-    #main-container {
-        layout: horizontal;
-        height: 1fr;
-    }
-    #chat-container {
-        width: 1fr;
-        height: 1fr;
-    }
-    #conversation-header {
-        height: 2;
-        padding: 0 1;
-        border-bottom: solid #26354b;
-    }
-    #conversation-label {
-        width: 1fr;
-        height: 1;
+        background: $background;
         color: $text-muted;
     }
-    #jump-latest.has-unread {
-        color: $primary;
-        text-style: bold;
-    }
-    ChatPanel {
-        height: 1fr;
-    }
-    Sidebar {
-        width: 32;
-        height: 1fr;
-        border-left: solid #26354b;
-    }
-    Composer {
-        height: 3;
-        margin: 0 1;
-        padding: 0 1;
-        background: $surface;
-        border: round #26354b;
-    }
-    Composer:focus {
-        border: round $primary;
-    }
-    #input-hints {
+    #workspace-header Button:hover { background: $surface; color: $text; }
+    #workspace-header Button:focus { background: $primary; color: $background; }
+    #workspace-header #stop-task { color: $error; }
+    #main-container { layout: horizontal; height: 1fr; }
+    #chat-container { width: 1fr; height: 1fr; }
+    ChatPanel { height: 1fr; }
+    Sidebar { width: 36; height: 1fr; border-left: solid $panel; }
+    #jump-latest {
+        display: none;
+        width: 100%;
         height: 1;
-        padding: 0 2;
-        color: $text-muted;
-    }
-    #footer-row {
-        height: 1;
-        padding: 0 1;
-        background: $surface;
-    }
-    #footer-row StatusFooter {
-        width: 1fr;
-        height: 1;
+        min-height: 1;
         border: none;
-        padding: 0;
+        background: $surface;
+        color: $primary;
     }
-    Screen.compact #workspace-context {
-        display: none;
-    }
-    Screen.compact Sidebar {
-        width: 1fr;
-        border-left: none;
-    }
-    Screen.short #workspace-header {
-        height: 2;
-    }
-    Screen.short #conversation-header {
-        height: 1;
-        border-bottom: none;
-    }
-    Screen.short #input-hints {
-        display: none;
-    }
-    Screen.tiny #fold-tools {
-        display: none;
-    }
+    #jump-latest.has-unread { display: block; }
+    ActivityBar { margin: 0 1; }
+    Composer { margin: 0 1; background: $surface; }
+    #input-hints { height: 1; padding: 0 2; color: $text-muted; }
+    #footer-row { height: 1; padding: 0 1; background: $background; }
+    #footer-row StatusFooter { width: 1fr; height: 1; border: none; padding: 0; }
+    Screen.compact #workspace-context { display: none; }
+    Screen.compact Sidebar { width: 1fr; border-left: none; }
+    Screen.short #input-hints { display: none; }
+    Screen.tiny #open-transcript, Screen.tiny #fold-tools { display: none; }
+    Screen.micro #workspace-brand { display: none; }
+    Screen.micro #workspace-header Button { width: 1fr; min-width: 1; margin-left: 0; padding: 0; }
     """
 
     BINDINGS = [
         Binding("ctrl+s", "interrupt", "停止任务", show=False, priority=True),
-        Binding("ctrl+k,f1", "open_commands", "命令", show=False, priority=True),
+        Binding("escape", "interrupt_main", "停止任务", show=False),
+        Binding("ctrl+p,f1", "open_commands", "命令", show=False, priority=True),
         Binding("ctrl+t", "toggle_transcript", "会话记录", show=False, priority=True),
         Binding("ctrl+b", "toggle_sidebar", "工作台", show=False, priority=True),
         Binding("ctrl+l", "jump_latest", "回到最新", show=False, priority=True),
         Binding("f2", "show_metrics", "运行指标", show=False, priority=True),
-        Binding("super+c,ctrl+shift+c", "copy_selection", "Copy selected text", show=False),
-        Binding("ctrl+shift+a", "copy_last_message", "Copy last reply", show=False),
-        Binding("ctrl+shift+t", "copy_transcript", "Copy transcript", show=False),
+        Binding("super+c,ctrl+shift+c", "copy_selection", "复制选中内容", show=False),
+        Binding("ctrl+shift+a", "copy_last_message", "复制最近回复", show=False),
+        Binding("ctrl+shift+t", "copy_transcript", "复制完整记录", show=False),
     ]
 
     def __init__(self, event_bus: EventBus, drx_agent=None):
         super().__init__()
         self.event_bus = event_bus
         self.drx_agent = drx_agent
-        self.title = "DRX-Operator"
+        self.title = "DRX"
         self._main_screen = None
-        self._sidebar_preference: bool | None = None
+        self._sidebar_preference = False
         self._tools_collapsed = True
+        transcript = getattr(drx_agent, "transcript", None)
+        self._owns_transcript = transcript is None
+        self.transcript = transcript if transcript is not None else TranscriptLog(event_bus)
+        master = getattr(drx_agent, "master", None)
+        messages = getattr(master, "messages", None)
+        if self._owns_transcript and messages:
+            self.transcript.restore_messages(messages)
+        root = getattr(master, "memory_namespace", None)
+        self._workspace_name = Path(root).name if isinstance(root, (str, Path)) and root else Path.cwd().name
         self.register_theme(Theme(
-            name="drx",
-            primary="#53d7c3",
-            secondary="#92a4bb",
-            accent="#53d7c3",
-            foreground="#e7edf7",
-            background="#0b1020",
-            surface="#111a2c",
-            panel="#17243a",
-            warning="#ffc36a",
-            error="#ff7f8a",
-            success="#53d7c3",
-            variables={"text-muted": "#92a4bb", "border": "#26354b"},
+            name="drx-black",
+            primary="#fab283", secondary="#a0a0a0", accent="#fab283",
+            foreground="#eeeeee", background="#090909", surface="#141414", panel="#1c1c1c",
+            warning="#f2c97d", error="#f87171", success="#a3be8c",
+            variables={"text-muted": "#a0a0a0", "border": "#303030"},
         ))
-        self.theme = "drx"
-
-    def _transcript_texts(self) -> list[str]:
-        master = getattr(self.drx_agent, "master", None)
-        messages = getattr(master, "messages", None) or []
-        texts: list[str] = []
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            role = str(msg.get("role") or "")
-            content = msg.get("content")
-            if isinstance(content, str):
-                body = content
-            elif isinstance(content, list):
-                body = "\n".join(
-                    str(b.get("text", ""))
-                    for b in content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            else:
-                body = ""
-            if body:
-                texts.append(f"[{role}] {body}")
-        return texts
+        self.theme = "drx-black"
+        self._clipboard_lock = asyncio.Lock()
+        self._clipboard_generation = 0
 
     def action_interrupt(self) -> None:
         self.event_bus.publish(Event(
-            type=EventType.AGENT_MESSAGE,
-            data={"text": "/stop", "source": "user"},
+            type=EventType.AGENT_MESSAGE, data={"text": "/stop", "source": "user"},
         ))
+
+    def action_interrupt_main(self) -> None:
+        if self.screen is self._main_screen:
+            self.action_interrupt()
 
     def action_toggle_transcript(self) -> None:
         if isinstance(self.screen, TranscriptScreen):
-            self.pop_screen()
-        else:
+            self.screen.action_pop_screen()
+        elif self.screen is self._main_screen:
             self.push_screen("transcript_view")
 
     def action_open_commands(self) -> None:
-        if not isinstance(self.screen, CommandPalette):
-            self.push_screen("command_palette", self._receive_command_draft)
+        if self._main_screen is not None and self.screen is self._main_screen:
+            self.push_screen(CommandPalette(self.event_bus), self._receive_command_draft)
 
     def _receive_command_draft(self, command: str | None) -> None:
-        if command is None or self._main_screen is None:
+        if command is None or self._main_screen is None or not (self._main_screen.is_mounted and self._main_screen.is_attached):
             return
-        composer = self._main_screen.query_one(Composer)
-        if composer.set_command_draft(command):
+        composer = next(iter(self._main_screen.query(Composer)), None)
+        if composer is None or not (composer.is_mounted and composer.is_attached):
+            return
+        if composer.set_command_draft(command) and self.screen is self._main_screen:
             self._main_screen.set_focus(composer, scroll_visible=False)
 
     def action_toggle_sidebar(self) -> None:
         if self._main_screen is None or self.screen is not self._main_screen:
             return
-        sidebar = self._main_screen.query_one(Sidebar)
-        self._sidebar_preference = not sidebar.display
+        self._sidebar_preference = not self._sidebar_preference
         self._apply_layout()
-        if sidebar.display:
-            sidebar.focus()
+        if self._sidebar_preference:
+            sidebar = self._main_screen.query_one(Sidebar)
+            agents = sidebar.query_one("#sidebar-agent-list")
+            (agents if agents.display else sidebar).focus()
         else:
             self._main_screen.query_one(Composer).focus()
 
@@ -277,11 +202,12 @@ class DrxAgentApp(App[None]):
             self._main_screen.query_one(RingIndicator).action_show_metrics()
 
     def on_chat_panel_unread_changed(self, message: ChatPanel.UnreadChanged) -> None:
-        if self._main_screen is None:
-            return
-        button = self._main_screen.query_one("#jump-latest", Button)
-        button.label = f"最新 +{message.count}" if message.count else "回到最新"
-        button.set_class(message.count > 0, "has-unread")
+        if self._main_screen is not None and (self._main_screen.is_mounted and self._main_screen.is_attached):
+            button = next(iter(self._main_screen.query("#jump-latest").results(Button)), None)
+            if button is None:
+                return
+            button.label = f"{message.count} 条新动态 · 回到最新 (Ctrl L)"
+            button.set_class(message.count > 0, "has-unread")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -303,125 +229,113 @@ class DrxAgentApp(App[None]):
         self._tools_collapsed = not self._tools_collapsed
         self._main_screen.query_one(ChatPanel).set_tools_collapsed(self._tools_collapsed)
         self._main_screen.query_one("#fold-tools", Button).label = (
-            "展开工具" if self._tools_collapsed else "收起工具"
+            "收起" if not self._tools_collapsed else "工具"
         )
 
     def on_resize(self) -> None:
         self.call_after_refresh(self._apply_layout)
 
     def _apply_layout(self) -> None:
-        if self._main_screen is None:
+        if self._main_screen is None or not self._main_screen.is_attached:
             return
         width, height = self.size
         compact = width < 100
-        sidebar_visible = (
-            not compact if self._sidebar_preference is None else self._sidebar_preference
-        )
-        sidebar = self._main_screen.query_one(Sidebar)
-        conversation = self._main_screen.query_one("#chat-container")
-        conversation_visible = not (compact and sidebar_visible)
+        sidebar = next(iter(self._main_screen.query(Sidebar)), None)
+        conversation = next(iter(self._main_screen.query("#chat-container")), None)
+        if sidebar is None or conversation is None or not sidebar.is_attached or not conversation.is_attached:
+            return
+        conversation_visible = not (compact and self._sidebar_preference)
         focus_will_hide = (
-            (not sidebar_visible and sidebar.has_focus_within)
+            (not self._sidebar_preference and sidebar.has_focus_within)
             or (not conversation_visible and conversation.has_focus_within)
         )
         self._main_screen.set_class(compact, "compact")
         self._main_screen.set_class(height <= 24, "short")
         self._main_screen.set_class(width < 70, "tiny")
-        sidebar.display = sidebar_visible
+        self._main_screen.set_class(width < 36, "micro")
+        sidebar.display = self._sidebar_preference
         conversation.display = conversation_visible
         if focus_will_hide:
             self._main_screen.set_focus(
                 sidebar if not conversation_visible else self._main_screen.query_one(Composer),
                 scroll_visible=False,
             )
-        self._main_screen.query_one("#workspace-brand", Static).update(
-            "DRX" if width < 70 else "DRX / OPERATOR"
-        )
         self._main_screen.query_one("#toggle-sidebar", Button).label = (
-            "回对话" if compact and sidebar_visible else "工作台"
+            "对话" if compact and self._sidebar_preference else "Agent"
         )
-        hints = (
-            "Enter 发送 · ↑↓ 历史 · Ctrl K 命令 · Ctrl B 工作台 · Ctrl S 停止"
-            if width >= 100 else "Enter 发送 · ↑↓ 历史 · Ctrl K 命令 · Ctrl B 工作台"
+        self._main_screen.query_one("#input-hints", Static).update(
+            "Enter 发送 · Shift Enter / Ctrl J 换行 · Tab 补全 · Ctrl P 命令 · Esc 停止"
+            if width >= 100 else "Enter 发送 · Shift Enter 换行 · Ctrl P 命令 · Esc 停止"
         )
-        self._main_screen.query_one("#input-hints", Static).update(hints)
-
-    def on_click(self, event) -> None:
-        if self._main_screen is None or self.screen is not self._main_screen:
-            return
-        widget = event.widget
-        while widget is not None and widget is not self._main_screen:
-            if widget.can_focus:
-                return
-            widget = widget.parent
-        self._main_screen.query_one(Composer).focus(scroll_visible=False)
-
-    def on_text_selected(self, event) -> None:
-        if self.screen is not self._main_screen:
-            return
-        from textual.widgets import Input
-
-        selections = getattr(self.screen, "selections", {}) or {}
-        if any(isinstance(w, Input) for w, sel in selections.items() if sel):
-            return
-        try:
-            text = self.screen.get_selected_text()
-        except Exception:
-            return
-        if text:
-            self._copy_text(text, "复制")
-
-    def _copy_text(self, text: str, title: str) -> None:
-        self.copy_to_clipboard(text)
-        if _copy_to_system_clipboard(text):
-            self.notify(f"已复制 {len(text)} 字符", title=title)
-        else:
-            self.notify(
-                "未找到系统剪贴板工具（macOS 需 pbcopy，Linux 需 xclip）",
-                title="复制",
-                severity="warning",
-            )
-
-    def action_copy_selection(self) -> None:
-        try:
-            text = self.screen.get_selected_text()
-        except Exception:
-            text = None
-        if not text:
-            raise SkipAction()
+    def copy_to_clipboard(self, text: str) -> None:
         self._copy_text(text, "复制")
 
-    def action_copy_last_message(self) -> None:
-        texts = self._transcript_texts()
-        assistant = [t for t in texts if t.startswith("[assistant]")]
-        if not assistant:
-            self.notify("还没有 Agent 回复可复制", title="复制")
+    def _copy_text(self, text: str, title: str) -> None:
+        # Textual stores the exact local clipboard before UTF-8/OSC52 encoding.
+        # Do not repair malformed Unicode by replacing the user's original data.
+        terminal_ok = True
+        try:
+            super().copy_to_clipboard(text)
+        except (UnicodeError, OSError):
+            terminal_ok = False
+        self._clipboard_generation += 1
+        generation = self._clipboard_generation
+        if self._main_screen is not None and self._main_screen.is_attached:
+            self.run_worker(self._copy_native(text, title, terminal_ok, generation), group="clipboard")
+
+    async def _copy_native(self, text: str, title: str, terminal_ok: bool, generation: int) -> None:
+        # Serialize native writers so a slow older copy cannot overwrite a newer
+        # request. Never block input/rendering on a missing or hung clipboard tool.
+        async with self._clipboard_lock:
+            if generation != self._clipboard_generation:
+                return
+            native_ok = await asyncio.to_thread(_copy_to_system_clipboard, text)
+        if generation != self._clipboard_generation or self._main_screen is None or not self._main_screen.is_attached:
             return
-        self._copy_text(assistant[-1][len("[assistant] "):], "复制最近回复")
+        if native_ok:
+            self.notify(f"已复制 {len(text)} 字符", title=title)
+        elif terminal_ok:
+            self.notify("终端剪贴板已发送；系统剪贴板工具不可用", title=title, severity="warning")
+        else:
+            self.notify("系统与终端剪贴板写入失败；原文保留在应用剪贴板", title=title, severity="error")
+
+    def action_copy_selection(self) -> None:
+        text = self.focused.selected_text if isinstance(self.focused, TextArea) else None
+        if not text:
+            text = self.screen.get_selected_text()
+        if not text:
+            raise SkipAction()
+        self._copy_text(text, "复制选中内容")
+
+    def action_copy_last_message(self) -> None:
+        text = self.transcript.last_assistant_text()
+        if text:
+            self._copy_text(text, "复制最近回复")
+        else:
+            self.notify("还没有 Agent 回复可复制", title="复制")
 
     def action_copy_transcript(self) -> None:
-        texts = self._transcript_texts()
-        if not texts:
+        text = self.transcript.render_text()
+        if text:
+            self._copy_text(text, "复制完整记录")
+        else:
             self.notify("会话记录为空", title="复制")
-            return
-        self._copy_text("\n".join(texts), "复制完整记录")
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="workspace-header"):
-            yield Static("DRX / OPERATOR", id="workspace-brand", markup=False)
-            yield Static("安全研究工作区", id="workspace-context", markup=False)
-            yield Button("命令", id="open-commands", tooltip="Ctrl K / F1 · 搜索命令")
-            yield Button("记录", id="open-transcript", tooltip="Ctrl T · 检索会话")
-            yield Button("工作台", id="toggle-sidebar", tooltip="Ctrl B · 任务与 Agent")
-            yield Button("停止", id="stop-task", tooltip="Ctrl S · 停止当前任务")
+            yield Static("DRX", id="workspace-brand", markup=False)
+            yield Static(self._workspace_name, id="workspace-context", markup=False)
+            yield Button("命令", id="open-commands", tooltip="Ctrl P / F1")
+            yield Button("记录", id="open-transcript", tooltip="Ctrl T · 搜索完整会话")
+            yield Button("工具", id="fold-tools", tooltip="展开或收起工具详情")
+            yield Button("Agent", id="toggle-sidebar", tooltip="Ctrl B · 查看任务与成员")
+            yield Button("停止", id="stop-task", tooltip="Esc / Ctrl S")
         with Container(id="main-container"):
             with Container(id="chat-container"):
-                with Horizontal(id="conversation-header"):
-                    yield Static("对话 / CONVERSATION", id="conversation-label", markup=False)
-                    yield Button("展开工具", id="fold-tools", tooltip="展开或收起所有工具结果")
-                    yield Button("回到最新", id="jump-latest", tooltip="Ctrl L · 恢复跟随输出")
-                yield ChatPanel(self.event_bus)
+                yield ChatPanel(self.event_bus, self.transcript)
+                yield Button("回到最新", id="jump-latest")
             yield Sidebar(self.event_bus)
+        yield ActivityBar(self.event_bus)
         yield Composer(self.event_bus)
         yield Static("", id="input-hints", markup=False)
         with Horizontal(id="footer-row"):
@@ -431,34 +345,41 @@ class DrxAgentApp(App[None]):
     async def on_mount(self) -> None:
         self._main_screen = self.screen
         self.install_screen(TranscriptScreen(self), name="transcript_view")
-        self.install_screen(CommandPalette(self.event_bus), name="command_palette")
         self._apply_layout()
-        self.query_one(Composer).border_title = "输入 / COMMAND"
-        try:
-            self.set_focus(self.query_one(Composer), scroll_visible=False)
-        except Exception:
-            pass
-        self.event_bus.publish(
-            Event(type=EventType.STATUS_UPDATE, data={"text": "就绪"})
-        )
+        self.query_one(Composer).border_title = "输入"
+        self.set_focus(self.query_one(Composer), scroll_visible=False)
+        self.event_bus.publish(Event(type=EventType.STATUS_UPDATE, data={"text": "就绪"}))
+        master = getattr(self.drx_agent, "master", None)
+        saved_usage = getattr(master, "session_usage", None)
+        if saved_usage is not None:
+            self.event_bus.publish(Event(EventType.STATUS_UPDATE, {
+                **usage_status(restore_usage(saved_usage)),
+                "mode": getattr(master, "mode", "act"),
+            }))
         if self.drx_agent is not None and hasattr(self.drx_agent, "async_setup"):
-            try:
-                await self.drx_agent.async_setup()
-            except Exception as exc:
-                self.event_bus.publish(
-                    Event(type=EventType.ERROR, data={"message": f"MCP setup failed: {exc}"})
-                )
+            self.run_worker(self._setup_agent(), name="mcp-startup", exit_on_error=False)
+
+    async def _setup_agent(self) -> None:
+        try:
+            await self.drx_agent.async_setup()
+        except Exception as exc:
+            self.event_bus.publish(Event(
+                type=EventType.ERROR, data={"message": f"MCP setup failed: {exc}"},
+            ))
 
     async def on_unmount(self) -> None:
-        self._auto_save()
-        if self.drx_agent is not None and hasattr(self.drx_agent, "async_teardown"):
-            try:
-                await self.drx_agent.async_teardown()
-            except Exception:
-                pass
-
-    def _auto_save(self) -> None:
+        self._main_screen = None
         try:
-            self.event_bus.publish(Event(type=EventType.SESSION_SAVE, data={}))
-        except Exception:
-            logger.exception("Session auto-save failed during shutdown")
+            if self.drx_agent is not None:
+                try:
+                    await self.drx_agent.async_teardown()
+                except Exception as exc:
+                    self.exit(return_code=1, message=Text(f"Runtime teardown failed: {exc}"))
+                else:
+                    try:
+                        self.drx_agent.save_session()
+                    except Exception as exc:
+                        self.exit(return_code=1, message=Text(f"Session auto-save failed: {exc}"))
+        finally:
+            if self._owns_transcript:
+                self.transcript.close()

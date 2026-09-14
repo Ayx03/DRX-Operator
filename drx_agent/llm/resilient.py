@@ -63,6 +63,7 @@ class ResilientProvider(LLMProvider):
 
     async def chat(self, messages, tools=None, stream=True):
         last_error_msg = "all providers failed"
+        last_error_metadata: dict = {}
         n_providers = len(self.providers)
 
         for p_idx, provider in enumerate(self.providers):
@@ -70,6 +71,7 @@ class ResilientProvider(LLMProvider):
             for attempt in range(self.max_retries + 1):
                 yielded_content = False
                 error_msg: Optional[str] = None
+                error_metadata: dict = {}
                 done_seen = False
 
                 try:
@@ -81,6 +83,7 @@ class ResilientProvider(LLMProvider):
                             yield ev
                         elif kind_value == "error":
                             error_msg = ev.content or "unknown error"
+                            error_metadata = ev.metadata
                             break
                         elif kind_value == "done":
                             done_seen = True
@@ -99,10 +102,12 @@ class ResilientProvider(LLMProvider):
                     yield AgentEvent(
                         type=AgentEventType.ERROR,
                         content=f"{error_msg} (mid-stream, not retried)",
+                        metadata=error_metadata,
                     )
                     return
 
                 last_error_msg = error_msg or "unknown error"
+                last_error_metadata = error_metadata
                 transient = _is_transient(last_error_msg)
 
                 if transient and attempt < self.max_retries:
@@ -129,6 +134,7 @@ class ResilientProvider(LLMProvider):
         yield AgentEvent(
             type=AgentEventType.ERROR,
             content=f"all LLM providers failed: {last_error_msg}",
+            metadata=last_error_metadata,
         )
 
     def count_tokens(self, messages):

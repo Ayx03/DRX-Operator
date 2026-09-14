@@ -28,6 +28,7 @@ logs/
 sessions/
 reports/
 *.db
+.drx/
 
 # Local tooling
 .claude/
@@ -39,3 +40,12 @@ tests/
 
 # Skills (local only, not published)
 skills/
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Vendored reference source (local only, not published)
+QWEN-EXO-booster/
+QWEN-EXO-booster*.zip

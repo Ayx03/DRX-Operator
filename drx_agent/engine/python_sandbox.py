@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import os
 from dataclasses import dataclass, field
+from drx_agent.engine.process import check_cancelled, run_process_sync
 
 
 @dataclass
@@ -40,6 +41,7 @@ class PythonSandbox:
     def run(self, code: str) -> SandboxResult:
         import time
         start = time.time()
+        check_cancelled()
         safe_code = self._wrap_code(code)
 
         with tempfile.NamedTemporaryFile(
@@ -49,10 +51,8 @@ class PythonSandbox:
             script_path = f.name
 
         try:
-            proc = subprocess.run(
+            proc = run_process_sync(
                 ['python3', script_path],
-                capture_output=True,
-                text=True,
                 timeout=self.timeout,
                 env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
             )

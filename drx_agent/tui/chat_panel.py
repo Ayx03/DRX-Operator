@@ -1,368 +1,323 @@
-"""Conversation cards, lossless tool output and anchored streaming."""
+"""Bounded, anchored conversation views over the lossless shared transcript."""
 
-import json
 from typing import Any
+from threading import Lock
 
 from rich.console import Group
 from rich.markdown import Markdown
 from rich.text import Text
-from rich.theme import Theme
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.message import Message
+from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, Static
+from textual.widgets import Button, Static
 
-from drx_agent.event_bus import Event, EventBus, EventType
+from drx_agent.event_bus import EventBus
 from drx_agent.tui.banner import build_banner
+from drx_agent.tui.transcript import TranscriptLog, literal_text, tool_summary
 
 
 class BannerBubble(Static):
-    """Compact startup identity and next step."""
-
     DEFAULT_CSS = """
-    BannerBubble {
-        height: auto;
-        width: 100%;
-        margin-bottom: 1;
-        padding: 1;
-        border-left: solid #26354b;
-        color: #92a4bb;
-    }
+    BannerBubble { height: auto; padding: 1; margin-bottom: 1;
+        border-left: solid $panel; color: $text-muted; }
     """
 
     def __init__(self) -> None:
         super().__init__(build_banner())
 
 
-class DiffBubble(Static):
-    """Literal unified diff with restrained, high-contrast line colors."""
-
-    DEFAULT_CSS = """
-    DiffBubble {
-        height: auto;
-        width: 100%;
-        margin-bottom: 1;
-        padding: 0 1;
-        border-left: solid #26354b;
-        background: #111a2c;
-    }
-    """
-
-    def __init__(self, title: str, diff_text: str) -> None:
-        super().__init__()
-        self._title = title
-        self._diff = diff_text
-        self._refresh()
-
-    def _refresh(self) -> None:
-        rendered = Text("变更 ", style="bold #53d7c3")
-        rendered.append(self._title + "\n")
-        if not self._diff.strip():
-            rendered.append("无文本变更", style="#92a4bb")
-        for line in self._diff.splitlines():
-            if line.startswith(("+++", "---")):
-                style = "#92a4bb"
-            elif line.startswith("@@"):
-                style = "bold #53d7c3"
-            elif line.startswith("+"):
-                style = "#53d7c3"
-            elif line.startswith("-"):
-                style = "#ff7f8a"
-            else:
-                style = "#e7edf7"
-            rendered.append(line + "\n", style=style)
-        self.update(rendered)
-
-
-class TodoBubble(Static):
-    """A literal snapshot of the current task list."""
-
-    DEFAULT_CSS = """
-    TodoBubble {
-        height: auto;
-        width: 100%;
-        margin-bottom: 1;
-        padding: 0 1;
-        border-left: solid #26354b;
-    }
-    """
-
-    _STATUS_GLYPH = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
-    _STATUS_STYLE = {
-        "pending": "#92a4bb", "in_progress": "#ffc36a", "completed": "#53d7c3",
-    }
-
-    def __init__(self, todos: list[dict[str, Any]]) -> None:
-        super().__init__()
-        self._todos = todos or []
-        self._refresh()
-
-    def _refresh(self) -> None:
-        rendered = Text(f"任务 ({len(self._todos)})\n", style="bold #53d7c3")
-        if not self._todos:
-            rendered.append("暂无任务", style="#92a4bb")
-        for todo in self._todos:
-            status = todo.get("status", "pending")
-            rendered.append(
-                self._STATUS_GLYPH.get(status, "[ ]") + " ",
-                style=self._STATUS_STYLE.get(status, "#92a4bb"),
-            )
-            rendered.append(
-                str(todo.get("content", "")) + "\n",
-                style="strike #92a4bb" if status == "completed" else "#e7edf7",
-            )
-        self.update(rendered)
-
-
 class ToolOutputScreen(ModalScreen[None]):
-    """Scrollable original tool output; clipboard never receives the preview."""
+    """Bounded literal pages; copy actions always use the complete original data."""
 
+    PAGE_CHARS = 20000
+    PAGE_LINES = 300
     BINDINGS = [Binding("escape", "close", "关闭", show=False)]
     DEFAULT_CSS = """
-    ToolOutputScreen { align: center middle; background: #0b1020 80%; }
+    ToolOutputScreen { align: center middle; background: $background 85%; }
     ToolOutputScreen > #tool-output-dialog {
         width: 92%; max-width: 110; height: 90%;
-        background: #111a2c; border: solid #26354b; padding: 0 1;
+        background: $surface; border: solid $panel; padding: 0 1;
     }
-    ToolOutputScreen #tool-output-title {
-        height: auto; max-height: 3; color: #53d7c3; text-style: bold;
+    ToolOutputScreen #tool-output-title { height: auto; color: $primary; text-style: bold; }
+    ToolOutputScreen #tool-output-page { height: auto; color: $text-muted; }
+    ToolOutputScreen #tool-output-scroll { height: 1fr; min-height: 3; }
+    ToolOutputScreen .tool-detail { height: auto; color: $text; }
+    ToolOutputScreen #tool-output-actions {
+        layout: grid; grid-size: 3; grid-columns: 1fr 1fr 1fr; grid-rows: 3 3; height: 6;
     }
-    ToolOutputScreen #tool-output-scroll { height: 1fr; }
-    ToolOutputScreen #tool-output-text { height: auto; color: #e7edf7; }
-    ToolOutputScreen #tool-output-actions { height: 3; align-horizontal: right; }
-    ToolOutputScreen Button { min-width: 8; width: auto; margin-left: 1; }
+    ToolOutputScreen.-narrow #tool-output-actions {
+        grid-size: 1 5; grid-columns: 1fr; grid-rows: 3; height: 15;
+    }
+    ToolOutputScreen Button { min-width: 0; width: 1fr; padding: 0; }
     """
 
-    def __init__(self, tool_name: str, output: str) -> None:
+    def __init__(self, tool_name: str, output: str, input_text: str = "") -> None:
         super().__init__()
-        self.tool_name = tool_name
-        self.output_text = output
+        self.tool_name = literal_text(tool_name)
+        self.output_text = literal_text(output)
+        self.input_text = literal_text(input_text)
+        self._pages = [(0, 0)]
+        self._page = 0
+        self._next_offsets = (0, 0)
+        self._dismiss_requested = False
+        self._dismissed = False
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="tool-output-dialog"):
-            yield Static(Text(f"完整输出 · {self.tool_name}"), id="tool-output-title")
+        with VerticalScroll(id="tool-output-dialog"):
+            yield Static(Content("完整记录 · " + bounded_preview(self.tool_name, 240, 2)), id="tool-output-title")
+            yield Static("", id="tool-output-page", markup=False)
             with VerticalScroll(id="tool-output-scroll"):
-                yield Static(Text(self.output_text), id="tool-output-text")
+                yield Static("", id="tool-input-text", classes="tool-detail", markup=False)
+                yield Static("", id="tool-output-text", classes="tool-detail", markup=False)
             with Horizontal(id="tool-output-actions"):
-                yield Button("复制原文", id="tool-output-copy", variant="primary")
+                yield Button("上一段", id="tool-page-previous")
+                yield Button("下一段", id="tool-page-next")
+                yield Button("复制输入", id="tool-input-copy", disabled=not self.input_text)
+                yield Button("复制输出", id="tool-output-copy", variant="primary")
                 yield Button("关闭", id="tool-output-close")
 
     def on_mount(self) -> None:
+        if self._dismiss_requested:
+            self.action_close()
+            return
+        self.set_class(self.size.width < 40, "-narrow")
+        self._render_page()
         self.query_one("#tool-output-scroll", VerticalScroll).focus()
+
+    def on_resize(self) -> None:
+        self.set_class(self.size.width < 40, "-narrow")
+
+    def on_screen_resume(self) -> None:
+        if self._dismiss_requested:
+            self.action_close()
+
+    def _page_end(self, text: str, start: int) -> int:
+        end = min(len(text), start + self.PAGE_CHARS)
+        cursor = start
+        for _ in range(self.PAGE_LINES):
+            newline = text.find("\n", cursor, end)
+            if newline < 0:
+                return end
+            cursor = newline + 1
+        return cursor
+
+    def _render_page(self) -> None:
+        input_start, output_start = self._pages[self._page]
+        input_end = self._page_end(self.input_text, input_start)
+        output_end = self._page_end(self.output_text, output_start)
+        self._next_offsets = input_end, output_end
+        self.query_one("#tool-input-text", Static).update(
+            Content("Input\n" + self.input_text[input_start:input_end] if input_end > input_start else "")
+        )
+        self.query_one("#tool-output-text", Static).update(Content(self.output_text[output_start:output_end]))
+        self.query_one("#tool-output-page", Static).update(
+            f"第 {self._page + 1} 段 · 输入 {input_start}–{input_end}/{len(self.input_text)}"
+            f" · 输出 {output_start}–{output_end}/{len(self.output_text)} 字符 · 复制不截断"
+        )
+        self.query_one("#tool-page-previous", Button).disabled = self._page == 0
+        self.query_one("#tool-page-next", Button).disabled = (
+            input_end == len(self.input_text) and output_end == len(self.output_text)
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
-        if event.button.id == "tool-output-copy":
-            copy_text = getattr(self.app, "_copy_text", None)
-            if callable(copy_text):
-                copy_text(self.output_text, "复制完整输出")
-            else:
-                self.app.copy_to_clipboard(self.output_text)
-                self.notify("完整输出已复制")
-        elif event.button.id == "tool-output-close":
+        if self._dismissed or not self.is_attached:
+            return
+        button_id = event.button.id
+        if button_id == "tool-output-close":
             self.action_close()
+            return
+        if self.app.screen is not self:
+            return
+        if button_id in {"tool-page-previous", "tool-page-next"}:
+            if event.button.disabled:
+                return
+            if button_id == "tool-page-previous":
+                self._page -= 1
+            else:
+                self._page += 1
+                if self._page == len(self._pages):
+                    self._pages.append(self._next_offsets)
+            self._render_page()
+            self.query_one("#tool-output-scroll", VerticalScroll).scroll_home(animate=False)
+            return
+        if button_id not in {"tool-input-copy", "tool-output-copy"}:
+            return
+        text = self.input_text if button_id == "tool-input-copy" else self.output_text
+        copy_text = getattr(self.app, "_copy_text", None)
+        if callable(copy_text):
+            copy_text(text, "复制完整原文")
+        else:
+            self.app.copy_to_clipboard(text)
 
     def action_close(self) -> None:
-        self.dismiss(None)
+        self._dismiss_requested = True
+        if not self._dismissed and self.is_attached and self.app.screen is self:
+            self._dismissed = True
+            self.dismiss(None)
 
 
-class ToolCard(Collapsible):
-    """Foldable tool result with a bounded preview and lossless detail view."""
+def bounded_preview(text: Any, limit: int = 2400, lines: int = 32) -> str:
+    text = literal_text(text)
+    preview = "\n".join(text[:limit].splitlines()[:lines])
+    if len(preview) < len(text.rstrip("\n")):
+        preview += "\n… 此处仅预览；完整原文可在详情或会话记录中查看/复制"
+    return preview
 
+
+class ToolCard(Vertical):
+    """Literal header and explicit content visibility, without Collapsible internals."""
+
+    collapsed = reactive(True, init=False)
     DEFAULT_CSS = """
-    ToolCard {
-        height: auto; width: 100%; margin-bottom: 1;
-        background: #111a2c; border-top: none;
-        border-left: solid #26354b; padding: 0;
+    ToolCard { height: auto; width: 100%; margin-bottom: 1;
+        background: $surface; border-left: solid $panel; padding: 0; }
+    ToolCard.tool-error { border-left: solid $error; }
+    ToolCard > .tool-title {
+        width: 100%; min-width: 0; height: auto; min-height: 1;
+        border: none; background: $surface; color: $text;
+        padding: 0 1; content-align: left middle; text-style: none;
     }
-    ToolCard.tool-error { border-left: solid #ff7f8a; }
-    ToolCard > CollapsibleTitle { background: #17243a; padding: 0 1; }
-    ToolCard > CollapsibleTitle:focus { background: #26354b; color: #e7edf7; }
-    ToolCard Contents { padding: 0 1; }
-    ToolCard .tool-preview { height: auto; }
+    ToolCard > .tool-title:focus { background: $panel; }
+    ToolCard > .tool-content { height: auto; padding: 0 1; }
+    ToolCard.-collapsed > .tool-content { display: none; }
+    ToolCard .tool-preview { height: auto; color: $text; }
     ToolCard .tool-full-output { width: auto; min-width: 12; height: 3; }
     """
 
-    _STATUS_LABEL = {
-        "running": "运行中", "done": "完成", "error": "失败", "pending": "待运行",
-    }
-    _STATUS_STYLE = {
-        "running": "#ffc36a", "done": "#53d7c3",
-        "error": "#ff7f8a", "pending": "#92a4bb",
-    }
+    def __init__(self, record: dict[str, Any]) -> None:
+        super().__init__()
+        self.record = record
+        self._title_text = ""
+        self._title_button = Button(Content(""), classes="tool-title")
+        self._body_widget = Static(classes="tool-preview", markup=False)
+        self._output_button = Button("完整输入 / 输出", classes="tool-full-output")
+        self.update_record(record)
 
-    def __init__(self, tool_name: str, preview: str) -> None:
-        self._tool_name = str(tool_name)
-        self._preview = preview or ""
-        self._status = "running"
-        self._output = ""
-        self._body_widget = Static(Text(self._preview[:600]), classes="tool-preview")
-        self._output_button = Button("完整输出", classes="tool-full-output", disabled=True)
-        super().__init__(
-            self._body_widget, self._output_button,
-            title=self._format_title(), collapsed=True,
-            collapsed_symbol="+", expanded_symbol="-",
-        )
-
-    def _format_title(self) -> str:
-        title = Text(
-            self._STATUS_LABEL.get(self._status, self._status) + " ",
-            style=self._STATUS_STYLE.get(self._status, "#92a4bb"),
-        )
-        title.append(self._tool_name, style="bold #e7edf7")
-        line = self._preview.split("\n", 1)[0]
-        title.append("  " + line[:80] + ("…" if len(line) > 80 else ""), style="#92a4bb")
-        return title.markup
+    def compose(self) -> ComposeResult:
+        yield self._title_button
+        with Vertical(classes="tool-content"):
+            yield self._body_widget
+            yield self._output_button
 
     def _watch_collapsed(self, collapsed: bool) -> None:
-        # Collapsible's default watcher scrolls the card into view. An automatic
-        # error expansion must never steal the reader's viewport from older text.
-        self._update_collapsed(collapsed)
-        self.post_message(self.Collapsed(self) if collapsed else self.Expanded(self))
+        self.set_class(collapsed, "-collapsed")
+        self._refresh_title()
 
-    def update_status(self, status: str) -> None:
-        if status:
-            self._status = status
-            self.title = self._format_title()
-            self.set_class(status == "error", "tool-error")
-            if status == "error":
-                self.collapsed = False
+    def _refresh_title(self) -> None:
+        self._title_button.label = Content(("+ " if self.collapsed else "- ") + self._title_text)
 
-    def apply_result(self, output: str, status: str = "done") -> None:
-        self._output = str(output)
-        self.update_status(status)
-        body = Text(self._preview[:600] + "\n", style="#92a4bb")
-        body.append("------\n", style="#26354b")
-        body.append(self._render_output(self._output, status))
-        self._body_widget.update(body)
-        self._output_button.disabled = False
-
-    def _render_output(self, output: str, status: str) -> Text:
-        if not output:
-            return Text(f"无输出 · {status}", style="#92a4bb")
-        text = output
-        # Formatting is cosmetic; the original bytes remain in _output.
-        if len(output) <= 4000:
-            try:
-                text = json.dumps(json.loads(output), ensure_ascii=False, indent=2)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        lines = text[:4001].splitlines()
-        body = "\n".join(lines[:80])[:4000]
-        truncated = len(text) > 4000 or len(lines) > 80
-        rendered = Text(body, style="#ff7f8a" if status == "error" else "#e7edf7")
-        if truncated:
-            rendered.append("\n预览已折叠；选择「完整输出」查看和复制原文。", style="#92a4bb")
-        return rendered
+    def update_record(self, record: dict[str, Any]) -> None:
+        previous_status = getattr(self, "_rendered_status", None)
+        self.record = record
+        status = record.get("status", "running")
+        self._rendered_status = status
+        self._title_text = bounded_preview(
+            f"{status} · {record.get('actor', 'master')} · {record.get('tool', 'tool')}"
+            f"  {tool_summary(record.get('tool', ''), record.get('input', ''))}",
+            limit=512, lines=4,
+        )
+        self.set_class(status == "error", "tool-error")
+        if status == "error" and previous_status != "error":
+            self.collapsed = False
+        self.set_class(self.collapsed, "-collapsed")
+        self._refresh_title()
+        body = bounded_preview(record.get("input"), 800, 10)
+        if "output" in record:
+            body += "\n------\n" + bounded_preview(record["output"])
+        self._body_widget.update(Content(body))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button is self._output_button:
-            event.stop()
-            self.app.push_screen(ToolOutputScreen(self._tool_name, self._output))
-
-
-class StreamingCursor(Static):
-    """Small streaming indicator, without focus or scrolling side effects."""
-
-    DEFAULT_CSS = """
-    StreamingCursor { height: 1; width: 3; margin-bottom: 1; color: #53d7c3; }
-    """
-
-    def __init__(self) -> None:
-        super().__init__(Text("|"))
-        self._on = True
-
-    def on_mount(self) -> None:
-        self.set_interval(0.5, self._blink)
-
-    def _blink(self) -> None:
-        self._on = not self._on
-        self.update(Text("|" if self._on else " "))
-
-
-_MARKDOWN_THEME = Theme({
-    **{f"markdown.h{level}": "bold #53d7c3" for level in range(1, 7)},
-    "markdown.code": "#e7edf7 on #17243a",
-    "markdown.code_block": "#e7edf7 on #17243a",
-    "markdown.block_quote": "#92a4bb",
-    "markdown.link": "underline #53d7c3",
-    "markdown.link_url": "#92a4bb",
-    "markdown.hr": "#26354b",
-})
-
-
-class _ConversationMarkdown:
-    def __init__(self, text: str) -> None:
-        self.markdown = Markdown(text, code_theme="github-dark", hyperlinks=False)
-
-    def __rich_console__(self, console, options):
-        # Render recursively inside the theme context; do not leak a global
-        # console theme into unrelated widgets or interpret Rich markup.
-        with console.use_theme(_MARKDOWN_THEME):
-            yield from console.render(self.markdown, options)
+        if event.button not in (self._title_button, self._output_button):
+            return
+        event.stop()
+        if not self.is_attached or self.app.screen is not self.screen:
+            return
+        if event.button is self._title_button:
+            self.collapsed = not self.collapsed
+        else:
+            self.app.push_screen(ToolOutputScreen(
+                f"{self.record.get('actor')} · {self.record.get('tool')}",
+                self.record.get("output", ""), literal_text(self.record.get("input")),
+            ))
 
 
 class MessageBubble(Static):
-    """One literal message, rendered as Markdown only after completion."""
+    """Use the same Markdown renderer for assistant deltas and final answers."""
 
     DEFAULT_CSS = """
-    MessageBubble {
-        height: auto; width: 100%; margin-bottom: 1;
-        padding: 0 1; border-left: solid #26354b; color: #e7edf7;
-    }
-    MessageBubble.user-message { background: #17243a; border-left: solid #92a4bb; }
-    MessageBubble.agent-message { border-left: solid #53d7c3; }
-    MessageBubble.system-message { color: #92a4bb; }
-    MessageBubble.error-message { border-left: solid #ff7f8a; background: #111a2c; }
-    MessageBubble.approval-message { border-left: solid #ffc36a; background: #111a2c; }
-    MessageBubble.approval-resolved { border-left: solid #26354b; }
+    MessageBubble { height: auto; width: 100%; margin-bottom: 1;
+        padding: 0 1; border-left: solid $panel; color: $text; }
+    MessageBubble.user-message { background: $surface; border-left: solid $secondary; }
+    MessageBubble.agent-message { border-left: solid $primary; }
+    MessageBubble.system-message { color: $text-muted; }
+    MessageBubble.error-message { border-left: solid $error; background: $surface; }
+    MessageBubble.approval-message { border-left: solid $primary; background: $surface; }
+    MessageBubble.approval-resolved { border-left: solid $panel; }
     """
 
-    def __init__(
-        self, marker: str = "Agent", marker_style: str = "#53d7c3",
-        text: str = "", body_style: str | None = None, markdown: bool = False,
-    ) -> None:
+    def __init__(self, record: dict[str, Any]) -> None:
         super().__init__()
-        self._marker = marker
-        self._marker_style = marker_style
-        self._body_style = body_style
-        self._markdown = markdown
-        self._md_ready = False
-        self._text = text
-        self._refresh_render()
+        self.update_record(record)
 
-    def append(self, delta: str) -> None:
-        if delta:
-            self._text += delta
-            self._refresh_render()
-
-    def set_text(self, text: str) -> None:
-        self._text = text
-        self._refresh_render()
-
-    def finalize(self) -> None:
-        if self._markdown and not self._md_ready:
-            self._md_ready = True
-            self._refresh_render()
-
-    def _refresh_render(self) -> None:
-        marker = Text(self._marker, style=f"bold {self._marker_style}")
-        if self._markdown and self._md_ready and self._text.strip():
-            self.update(Group(marker, _ConversationMarkdown(self._text)))
+    def update_record(self, record: dict[str, Any]) -> None:
+        kind = literal_text(record.get("kind") or "system")
+        role = literal_text(record.get("role") or kind)
+        actor = literal_text(record.get("actor") or "master")
+        self.set_classes({"user": "user-message", "assistant": "agent-message",
+                          "approval": "approval-message", "error": "error-message"}.get(role, "system-message"))
+        if kind == "approval":
+            status = literal_text(record.get("status") or "pending")
+            marker = {"pending": "待审批", "approved": "已批准", "denied": "已拒绝"}.get(status, status)
+            self.set_class(status != "pending", "approval-resolved")
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            text = (f"{data.get('operation', '')} -> {data.get('target') or '(local)'}\n"
+                    f"{data.get('risk_level', '')} · {actor} · {data.get('request_id', '')}")
+            if status == "pending":
+                text += "\n请在审批窗口响应"
+                if data.get("requires_confirmation_phrase"):
+                    text += " · I CONFIRM DESTRUCTIVE ACTION"
+        elif kind == "worker":
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            status = literal_text(record.get("status") or data.get("status") or "queued")
+            marker = "协作 · " + {
+                "queued": "排队中", "running": "执行中", "done": "已完成",
+                "error": "失败", "cancelled": "已取消",
+            }.get(status, status)
+            text = f"{data.get('role') or data.get('type') or 'worker'} → {data.get('target') or '—'}"
+            if data.get("task"):
+                text += "\n" + bounded_preview(str(data["task"]), limit=240, lines=2)
+            outcome = data.get("error") or data.get("text")
+            if outcome:
+                text += "\n" + bounded_preview(str(outcome), limit=320, lines=2)
         else:
-            marker.append("\n" + self._text, style=self._body_style or "#e7edf7")
-            self.update(marker)
+            marker = {"user": "你", "assistant": "Agent", "system": "系统", "error": "错误"}.get(role, role)
+            text = literal_text(record.get("text"))
+        text = bounded_preview(text, limit=20000, lines=300)
+        if actor != "master":
+            marker += " · " + actor
+        heading = Text(marker, style="bold")
+        if role == "assistant" and text.strip():
+            self.update(Group(heading, Markdown(text, code_theme="github-dark", hyperlinks=False)))
+        else:
+            heading.append("\n" + text)
+            self.update(heading)
 
 
 class ChatPanel(VerticalScroll):
-    """Anchored conversation; scrolling away suspends following until bottom."""
+    """Render at most WINDOW_SIZE records; preserve a reader's frozen old page."""
 
+    WINDOW_SIZE = 80
     DEFAULT_CSS = """
-    ChatPanel { background: #0b1020; padding: 1 1 0 1; }
+    ChatPanel { background: $background; padding: 1 1 0 1; }
     ChatPanel > #conversation-body { height: auto; min-height: 100%; }
+    ChatPanel #history-navigation { height: auto; }
+    ChatPanel #history-navigation Button { width: auto; min-width: 12; }
     """
 
     class UnreadChanged(Message):
@@ -370,69 +325,196 @@ class ChatPanel(VerticalScroll):
             self.count = count
             super().__init__()
 
-    class BusEvent(Message):
-        """Thread-safe event handoff into Textual's message queue."""
+    class RecordsReady(Message):
         bubble = False
 
-        def __init__(self, event: Event) -> None:
-            self.event = event
-            super().__init__()
 
-    def __init__(self, event_bus: EventBus):
+    def __init__(self, event_bus: EventBus, transcript: TranscriptLog) -> None:
         super().__init__()
         self.event_bus = event_bus
-        self._streams: dict[str, MessageBubble] = {}
-        self._open_tools: dict[int, ToolCard] = {}
-        self._approvals: dict[str, MessageBubble] = {}
-        self._approval_details: dict[str, str] = {}
-        self._cursor: StreamingCursor | None = None
-        self._active_streams: set[str] = set()
-        self._unread: set[Widget] = set()
+        self.transcript = transcript
+        self._widgets: dict[str, Widget] = {}
+        self._unread: set[str] = set()
         self._tools_collapsed = True
+        self._start = 0
+        self._end = 0
         self._subscribed = False
-        self._handlers = {
-            EventType.AGENT_MESSAGE: self._on_agent_message,
-            EventType.TOOL_CALL: self._on_tool_call,
-            EventType.TOOL_RESULT: self._on_tool_result,
-            EventType.SUB_AGENT_DISPATCH: self._on_sub_dispatch,
-            EventType.SUB_AGENT_RESULT: self._on_sub_result,
-            EventType.APPROVAL_REQUEST: self._on_approval,
-            EventType.APPROVAL_RESOLVED: self._on_approval_resolved,
-            EventType.ERROR: self._on_error,
-        }
+        self._rebuilding = False
+        self._pending_lock = Lock()
+        self._pending_records: set[str] = set()
+        self._pending_reset = False
+        self._generation = transcript.generation
+        self._refresh_queued = False
 
     def compose(self) -> ComposeResult:
-        # Native anchoring may use a negative offset for short content. A full
-        # viewport body keeps the first messages at the top without overriding
-        # Textual's scroll-follow and scrollback behavior.
+        with Horizontal(id="history-navigation"):
+            yield Button("加载更早记录", id="history-older")
+            yield Button("较新记录", id="history-newer")
         yield Vertical(id="conversation-body")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.anchor()
-        self.query_one("#conversation-body", Vertical).mount(BannerBubble())
-        for event_type in self._handlers:
-            self.event_bus.subscribe(event_type, self._queue_event)
         self._subscribed = True
+        self.transcript.subscribe(self._queue_record)
+        await self._show_window(max(0, self.transcript.record_count - self.WINDOW_SIZE))
 
     def on_unmount(self) -> None:
-        self._subscribed = False
-        for event_type in self._handlers:
-            self.event_bus.unsubscribe(event_type, self._queue_event)
+        with self._pending_lock:
+            self._subscribed = False
+            self._pending_records.clear()
+            self._pending_reset = False
+            self._refresh_queued = False
+        self.transcript.unsubscribe(self._queue_record)
 
-    def _queue_event(self, event: Event) -> None:
-        # post_message is thread-safe, unlike mounting/updating a widget. Never
-        # fall back to calling UI handlers on the publishing worker's thread.
-        if self._subscribed:
-            self.post_message(self.BusEvent(event))
+    def _queue_record(self, record_id: str | None) -> None:
+        # Coalesce token bursts by record, rather than queueing one UI message per token.
+        with self._pending_lock:
+            if not self._subscribed:
+                return
+            if record_id is None:
+                self._pending_reset = True
+                self._pending_records.clear()
+            else:
+                self._pending_records.add(record_id)
+        self._schedule_refresh()
 
-    def on_chat_panel_bus_event(self, message: BusEvent) -> None:
+    def _schedule_refresh(self) -> None:
+        with self._pending_lock:
+            if (not self._subscribed or self._refresh_queued
+                    or not (self._pending_reset or self._pending_records)):
+                return
+            self._refresh_queued = True
+        self.post_message(self.RecordsReady())
+
+    async def on_chat_panel_records_ready(self, message: RecordsReady) -> None:
         message.stop()
-        if self._subscribed:
-            self._handlers[message.event.type](message.event)
+        try:
+            await self._flush_pending()
+        finally:
+            with self._pending_lock:
+                self._refresh_queued = False
+            self._schedule_refresh()
+
+    def _view_is_current(self, generation: int) -> bool:
+        if not self._subscribed or not self.is_attached:
+            return False
+        if generation != self.transcript.generation:
+            self._queue_record(None)
+            return False
+        return True
+
+    def _make_widget(self, record: dict[str, Any]) -> Widget:
+        if record["kind"] == "tool":
+            widget = ToolCard(record)
+            if record.get("status") != "error":
+                widget.collapsed = self._tools_collapsed
+            return widget
+        return MessageBubble(record)
+
+    async def _show_window(self, start: int) -> bool:
+        generation = self.transcript.generation
+        if not self._view_is_current(generation):
+            return False
+        self._rebuilding = True
+        try:
+            start = max(0, min(start, self.transcript.record_count))
+            records = self.transcript.window(start, self.WINDOW_SIZE)
+            body = self.query_one("#conversation-body", Vertical)
+            await body.remove_children()
+            if not self._view_is_current(generation):
+                return False
+            self._widgets.clear()
+            widgets = []
+            if not records:
+                widgets.append(BannerBubble())
+            for record in records:
+                widget = self._make_widget(record)
+                self._widgets[record["id"]] = widget
+                widgets.append(widget)
+            if widgets:
+                await body.mount(*widgets)
+            if not self._view_is_current(generation):
+                return False
+            self._start, self._end = start, start + len(records)
+            self._generation = generation
+            self._update_navigation()
+            return True
+        finally:
+            self._rebuilding = False
+
+    def _update_navigation(self) -> None:
+        if not self._subscribed or not self.is_attached:
+            return
+        count = self.transcript.record_count
+        self.query_one("#history-older", Button).disabled = self._start == 0
+        self.query_one("#history-newer", Button).disabled = self._end >= count
+        self.query_one("#history-navigation").display = count > self.WINDOW_SIZE
+
+    async def _flush_pending(self) -> None:
+        if not self._subscribed or not self.is_attached:
+            return
+        with self._pending_lock:
+            pending, self._pending_records = self._pending_records, set()
+            reset, self._pending_reset = self._pending_reset, False
+        generation = self.transcript.generation
+        if reset or generation != self._generation:
+            self._clear_unread()
+            if await self._show_window(max(0, self.transcript.record_count - self.WINDOW_SIZE)):
+                self.call_after_refresh(self.scroll_end, animate=False)
+            return
+        if not pending:
+            return
+        following = not self._anchor_released
+        if not following:
+            previous = len(self._unread)
+            self._unread.update(pending)
+            if len(self._unread) != previous:
+                self.post_message(self.UnreadChanged(len(self._unread)))
+        count = self.transcript.record_count
+        if self._end >= count or (not following and len(self._widgets) >= self.WINDOW_SIZE):
+            # Stream updates touch only visible dirty records, never copy the full log.
+            for record_id, widget in self._widgets.items():
+                if record_id in pending:
+                    record = self.transcript.get(record_id)
+                    if record is not None and self._view_is_current(generation):
+                        widget.update_record(record)
+            self._update_navigation()
+            return
+        start = max(0, count - self.WINDOW_SIZE) if following else self._start
+        records = self.transcript.window(start, self.WINDOW_SIZE)
+        wanted = {record["id"] for record in records}
+        self._rebuilding = True
+        try:
+            body = self.query_one("#conversation-body", Vertical)
+            obsolete = [widget for record_id, widget in self._widgets.items() if record_id not in wanted]
+            obsolete.extend(body.query(BannerBubble))
+            if obsolete:
+                await body.remove_children(obsolete)
+            if not self._view_is_current(generation):
+                return
+            self._widgets = {key: value for key, value in self._widgets.items() if key in wanted}
+            new_widgets = []
+            for record in records:
+                widget = self._widgets.get(record["id"])
+                if widget is None:
+                    widget = self._make_widget(record)
+                    self._widgets[record["id"]] = widget
+                    new_widgets.append(widget)
+                elif record["id"] in pending:
+                    widget.update_record(record)
+            if new_widgets:
+                await body.mount(*new_widgets)
+            if not self._view_is_current(generation):
+                return
+            self._start, self._end = start, start + len(records)
+            self._update_navigation()
+        finally:
+            self._rebuilding = False
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
-        if new_value >= self.max_scroll_y and self._unread:
+        if (self._subscribed and not self._rebuilding and new_value >= self.max_scroll_y
+                and self._end >= self.transcript.record_count):
             self._clear_unread()
 
     def _clear_unread(self) -> None:
@@ -441,196 +523,36 @@ class ChatPanel(VerticalScroll):
             self.post_message(self.UnreadChanged(0))
 
     def jump_latest(self) -> None:
-        """Resume native bottom-following without changing keyboard focus."""
+        """Explicitly restore bottom following without stealing focus."""
+        if self._subscribed and self.is_attached:
+            self.call_next(self._jump_latest)
+
+    async def _jump_latest(self) -> None:
+        if not self._subscribed or not self.is_attached:
+            return
+        start = max(0, self.transcript.record_count - self.WINDOW_SIZE)
+        if (self._start != start or self._end < self.transcript.record_count
+                or self._generation != self.transcript.generation):
+            if not await self._show_window(start):
+                return
         self._clear_unread()
+        self.anchor()
         self.scroll_end(animate=False)
+        self.call_after_refresh(self.scroll_end, animate=False)
 
     def set_tools_collapsed(self, collapsed: bool) -> None:
-        """Set current and future tool-card expansion state."""
         self._tools_collapsed = collapsed
         for card in self.query(ToolCard):
             card.collapsed = collapsed
 
-    def _record_activity(self, bubble: Widget) -> None:
-        # Textual's anchor handles reflow, queued layouts, mouse/keyboard and
-        # scrollbar navigation. Count changed messages, never individual tokens.
-        if self._anchor_released and self.max_scroll_y > 0 and bubble not in self._unread:
-            self._unread.add(bubble)
-            self.post_message(self.UnreadChanged(len(self._unread)))
-
-    def _append(self, bubble: Widget) -> None:
-        self._record_activity(bubble)
-        self.query_one("#conversation-body", Vertical).mount(bubble)
-
-
-    def _on_agent_message(self, event: Event) -> None:
-        data = event.data
-        if data.get("streaming"):
-            self._handle_stream(data)
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id not in {"history-older", "history-newer"}:
             return
-        text = data.get("text") or data.get("content", "")
-        if not text:
+        if not self._subscribed or not self.is_attached:
             return
-        is_agent = data.get("role") == "assistant" or data.get("source") == "agent"
-        if is_agent:
-            marker, style, css = "Agent", "#53d7c3", "agent-message"
-        elif data.get("source") == "system" or data.get("role") == "system":
-            marker, style, css = "系统", "#92a4bb", "system-message"
-        else:
-            marker, style, css = "你", "#92a4bb", "user-message"
-        bubble = MessageBubble(marker, style, str(text), markdown=is_agent)
-        bubble.add_class(css)
-        if is_agent:
-            bubble.finalize()
-        self._append(bubble)
-
-    def _ensure_cursor(self) -> None:
-        if self._cursor is None:
-            self._cursor = StreamingCursor()
-            self.query_one("#conversation-body", Vertical).mount(self._cursor)
-
-    def _remove_cursor(self) -> None:
-        if self._cursor is not None:
-            self._cursor.remove()
-            self._cursor = None
-
-    def _handle_stream(self, data: dict[str, Any]) -> None:
-        sid = data.get("stream_id")
-        if not sid:
+        event.stop()
+        start = max(0, self._start - self.WINDOW_SIZE) if event.button.id == "history-older" else self._end
+        if not await self._show_window(start):
             return
-        bubble = self._streams.get(sid)
-        if data.get("final"):
-            self._active_streams.discard(sid)
-            self._streams.pop(sid, None)
-            full = data.get("text")
-            if full is None:
-                full = data.get("content")
-            if bubble is None and full:
-                bubble = MessageBubble(text=str(full), markdown=True)
-                bubble.add_class("agent-message")
-                self._append(bubble)
-            if bubble is not None:
-                if full is not None and str(full) != bubble._text:
-                    bubble.set_text(str(full))
-                bubble.finalize()
-                self._record_activity(bubble)
-            if not self._active_streams:
-                self._remove_cursor()
-            return
-        delta = data.get("delta", "")
-        if not delta:
-            return
-        if bubble is None:
-            bubble = MessageBubble(markdown=True)
-            bubble.add_class("agent-message")
-            self._streams[sid] = bubble
-            self._append(bubble)
-        bubble.append(str(delta))
-        self._record_activity(bubble)
-        self._active_streams.add(sid)
-        self._ensure_cursor()
-
-    def _on_tool_call(self, event: Event) -> None:
-        data = event.data
-        tool_name = data.get("tool") or (
-            f"execute_{data.get('language', 'script')}_script#{data.get('script_num', '?')}"
-        )
-        card = ToolCard(tool_name, str(data.get("code", "")))
-        card.collapsed = self._tools_collapsed
-        card.update_status(data.get("status", "running"))
-        call_seq = data.get("call_seq")
-        if call_seq is not None:
-            self._open_tools[call_seq] = card
-        self._append(card)
-
-    _DIFF_TOOLS = {"write_file", "edit_file", "multi_edit_file"}
-
-    def _on_tool_result(self, event: Event) -> None:
-        data = event.data
-        tool = str(data.get("tool", "工具"))
-        output = data.get("output", "")
-        status = data.get("status", "done")
-        if not output:
-            output = str(data.get("stdout", ""))
-            stderr = str(data.get("stderr", ""))
-            if stderr:
-                output += ("\n" if output else "") + stderr
-        if not isinstance(output, str):
-            output = json.dumps(output, ensure_ascii=False)
-        call_seq = data.get("call_seq")
-        card = self._open_tools.pop(call_seq, None) if call_seq is not None else None
-        if card is None:
-            card = ToolCard(tool, "")
-            card.collapsed = self._tools_collapsed
-            self._append(card)
-        card.apply_result(output, status)
-        self._record_activity(card)
-        if tool in self._DIFF_TOOLS and output and status != "error":
-            try:
-                parsed = json.loads(output)
-            except (json.JSONDecodeError, TypeError):
-                parsed = None
-            if isinstance(parsed, dict) and not parsed.get("error"):
-                self._append(DiffBubble(
-                    title=str(parsed.get("summary") or parsed.get("path") or tool),
-                    diff_text=str(parsed.get("diff") or ""),
-                ))
-
-    def _on_sub_dispatch(self, event: Event) -> None:
-        data = event.data
-        bubble = MessageBubble(
-            "协作", "#53d7c3",
-            f"{data.get('type', '?')} -> {data.get('target', '?')}",
-        )
-        bubble.add_class("system-message")
-        self._append(bubble)
-
-    def _on_sub_result(self, event: Event) -> None:
-        bubble = MessageBubble(
-            "协作", "#92a4bb", str(event.data.get("status", "")), "#92a4bb",
-        )
-        bubble.add_class("system-message")
-        self._append(bubble)
-
-    def _on_approval(self, event: Event) -> None:
-        data = event.data
-        request_id = str(data.get("request_id", ""))
-        detail = (
-            f"[{data.get('risk_level', 'L2')}] {request_id[:8]} · {data.get('agent_id', 'master')}\n"
-            f"{data.get('operation', '')} -> {data.get('target') or '(local)'}"
-        )
-        choices = (
-            "输入 I CONFIRM DESTRUCTIVE ACTION 批准；[n]拒绝 [v]详情"
-            if data.get("requires_confirmation_phrase") else "[y]批准 [n]拒绝 [v]详情"
-        )
-        bubble = self._approvals.get(request_id) if request_id else None
-        if bubble is None:
-            bubble = MessageBubble("待审批", "#ffc36a", detail + "\n" + choices)
-            bubble.add_class("approval-message")
-            self._append(bubble)
-        else:
-            bubble.set_text(detail + "\n" + choices)
-            self._record_activity(bubble)
-        if request_id:
-            self._approvals[request_id] = bubble
-            self._approval_details[request_id] = detail
-
-    def _on_approval_resolved(self, event: Event) -> None:
-        request_id = str(event.data.get("request_id", ""))
-        bubble = self._approvals.pop(request_id, None)
-        detail = self._approval_details.pop(request_id, "")
-        if bubble is None:
-            return
-        approved = event.data.get("approved") is True
-        bubble._marker = "已批准" if approved else "已拒绝"
-        bubble._marker_style = "#53d7c3" if approved else "#ff7f8a"
-        bubble.add_class("approval-resolved")
-        bubble.set_text(detail)
-        self._record_activity(bubble)
-
-    def _on_error(self, event: Event) -> None:
-        bubble = MessageBubble(
-            "错误", "#ff7f8a", str(event.data.get("message", "")), "#ff7f8a",
-        )
-        bubble.add_class("error-message")
-        self._append(bubble)
+        self.scroll_home(animate=False)
+        self.release_anchor()

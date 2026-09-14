@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
-MAX_INTENTS = 60
+MAX_INTENTS = 512
 # 仅"方向本身错"参与死路拦截；execution/environment/prerequisite/policy/
 # timeout/resource/dominated/expired 属可恢复或非方向性失败，不拦重试。
 _BLOCKING_CATEGORIES = ("strategy",)
@@ -75,7 +75,14 @@ class DeadEnd:
 
 
 class Frontier:
-    def __init__(self) -> None:
+    def __init__(self, *, max_intents: int = MAX_INTENTS) -> None:
+        if (
+            isinstance(max_intents, bool)
+            or not isinstance(max_intents, int)
+            or max_intents <= 0
+        ):
+            raise ValueError("max_intents must be a positive integer")
+        self.max_intents = max_intents
         self._intents: dict[str, Intent] = {}
         self._dead_ends: list[DeadEnd] = []
         self._enabled_by: dict[str, list[str]] = {}
@@ -90,6 +97,34 @@ class Frontier:
         if len(self._history) > HISTORY_CAP:
             del self._history[: len(self._history) - HISTORY_CAP]
         return eid
+
+    def _evict_terminal(self) -> None:
+        oldest = min(
+            (
+                intent for intent in self._intents.values()
+                if intent.status in (IntentStatus.DONE, IntentStatus.DEAD)
+            ),
+            key=lambda intent: intent.budget.created_ts,
+            default=None,
+        )
+        if oldest is None:
+            raise ValueError(
+                f"Frontier capacity ({self.max_intents}) reached; "
+                "all intents are open or claimed"
+            )
+        del self._intents[oldest.id]
+        for dep in oldest.depends_on:
+            remaining = [
+                iid for iid in self._enabled_by.get(dep, []) if iid != oldest.id
+            ]
+            if remaining:
+                self._enabled_by[dep] = remaining
+            else:
+                self._enabled_by.pop(dep, None)
+        self._append_event(
+            "intent.evicted",
+            {"intent_id": oldest.id, "status": oldest.status.value, "reason": "capacity"},
+        )
 
     def add_intent(
         self,
@@ -118,10 +153,11 @@ class Frontier:
                 and intent.action == action
             ):
                 return None
-        if len(self._intents) >= MAX_INTENTS:
-            oldest = min(self._intents.values(), key=lambda i: i.budget.created_ts)
-            self._intents.pop(oldest.id, None)
-        iid = f"it-{uuid.uuid4().hex[:6]}"
+        if len(self._intents) >= self.max_intents:
+            self._evict_terminal()
+        iid = f"it-{uuid.uuid4().hex}"
+        if iid in self._intents:
+            raise ValueError("intent identifier collision; existing work was preserved")
         self._intents[iid] = Intent(
             id=iid,
             hypothesis=hypothesis,
@@ -419,6 +455,7 @@ class Frontier:
 
     def to_dict(self) -> dict:
         return {
+            "max_intents": self.max_intents,
             "intents": [
                 {
                     "id": i.id,
@@ -452,8 +489,9 @@ class Frontier:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Frontier":
-        f = cls()
+    def from_dict(cls, data: dict, *, max_intents: int | None = None) -> "Frontier":
+        capacity = (data or {}).get("max_intents", MAX_INTENTS) if max_intents is None else max_intents
+        f = cls(max_intents=capacity)
         for raw in (data or {}).get("intents") or []:
             if not isinstance(raw, dict):
                 continue
@@ -502,4 +540,6 @@ class Frontier:
         f._history = [
             e for e in ((data or {}).get("history") or []) if isinstance(e, dict)
         ]
+        while len(f._intents) > f.max_intents:
+            f._evict_terminal()
         return f

@@ -48,6 +48,9 @@ ALWAYS_ALLOWED: frozenset[str] = frozenset(
         "irc_send", "irc_inbox", "irc_reply", "irc_pending", "irc_close",
         "irc_admin_close",
         "note_update", "note_read", "note_clear",
+        "role_list", "team_vote", "vote_cast", "vote_status",
+        "memory_search", "memory_get", "memory_add", "memory_admit",
+        "memory_reject", "memory_invalidate", "memory_consolidate",
     }
 )
 
@@ -201,17 +204,21 @@ class StageMachine:
         return self.capability().allowed_tools | ALWAYS_ALLOWED
 
     def is_allowed(self, tool_name: str) -> bool:
-        return tool_name in self.allowed_tools()
+        # MCP tools have unknown side effects and belong only to the full-tools stage.
+        return (
+            tool_name in self.capability().allowed_tools
+            or tool_name in ALWAYS_ALLOWED
+            or (self.stage is Stage.RESEARCH and tool_name.startswith("mcp__"))
+        )
 
     def filter_schemas(self, schemas: list[dict]) -> list[dict]:
         """Keep only stage-allowed tools; sort by name for a cache-friendly
         stable prefix."""
-        allowed = self.allowed_tools()
         kept: list[dict] = []
         for schema in schemas:
             fn = schema.get("function") if isinstance(schema, dict) else None
             name = fn.get("name") if isinstance(fn, dict) else None
-            if name in allowed:
+            if isinstance(name, str) and self.is_allowed(name):
                 kept.append(schema)
         kept.sort(key=lambda s: s["function"]["name"])
         return kept

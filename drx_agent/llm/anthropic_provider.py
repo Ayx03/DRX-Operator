@@ -4,6 +4,7 @@ Converts between OpenAI-format tool schemas/messages and Anthropic's
 tool_use content blocks so the agent keeps one canonical format."""
 
 import json
+from urllib.parse import urlparse
 
 from drx_agent.llm.base import (
     AgentEvent,
@@ -130,17 +131,30 @@ def _to_anthropic_messages(messages):
 def _extract_usage(usage_obj):
     if usage_obj is None:
         return None
+    get = usage_obj.get if isinstance(usage_obj, dict) else lambda key: getattr(usage_obj, key, None)
     out = {}
-    # Anthropic reports input_tokens / output_tokens.
-    for attr, dest in (
-        ("input_tokens", "prompt_tokens"),
-        ("output_tokens", "completion_tokens"),
-        ("cache_read_input_tokens", "prompt_cache_hit_tokens"),
-        ("cache_creation_input_tokens", "prompt_cache_miss_tokens"),
+    ordinary = get("input_tokens")
+    reads = get("cache_read_input_tokens")
+    writes = get("cache_creation_input_tokens")
+    if ordinary is not None:
+        out["prompt_tokens"] = int(ordinary) + int(reads or 0) + int(writes or 0)
+        if reads is not None or writes is not None:
+            out["prompt_cache_miss_tokens"] = int(ordinary) + int(writes or 0)
+    for value, dest in (
+        (get("output_tokens"), "completion_tokens"),
+        (reads, "prompt_cache_hit_tokens"),
+        (writes, "prompt_cache_write_tokens"),
     ):
-        v = getattr(usage_obj, attr, None)
-        if v is not None:
-            out[dest] = int(v)
+        if value is not None:
+            out[dest] = int(value)
+    creation = get("cache_creation")
+    for attr, dest in (
+        ("ephemeral_5m_input_tokens", "prompt_cache_write_5m_tokens"),
+        ("ephemeral_1h_input_tokens", "prompt_cache_write_1h_tokens"),
+    ):
+        value = creation.get(attr) if isinstance(creation, dict) else getattr(creation, attr, None)
+        if value is not None:
+            out[dest] = int(value)
     if "prompt_tokens" in out and "completion_tokens" in out:
         out["total_tokens"] = out["prompt_tokens"] + out["completion_tokens"]
     return out or None
@@ -153,6 +167,7 @@ class AnthropicProvider(LLMProvider):
             import anthropic
             self.client = anthropic.AsyncAnthropic(
                 api_key=config.api_key,
+                base_url=config.base_url or None,
                 timeout=120.0,
                 max_retries=0,
             )
@@ -170,6 +185,10 @@ class AnthropicProvider(LLMProvider):
                 "temperature": self.config.temperature,
                 "messages": anthropic_messages,
             }
+            # extra_body also works with older SDKs lacking a cache_control keyword.
+            # Do not send Anthropic-only extensions to custom compatible endpoints.
+            if urlparse(str(self.client.base_url)).hostname == "api.anthropic.com":
+                kwargs["extra_body"] = {"cache_control": {"type": "ephemeral"}}
             if system:
                 kwargs["system"] = system
             if anthropic_tools:
@@ -220,6 +239,7 @@ class AnthropicProvider(LLMProvider):
                     "assistant_message": assistant_message,
                     "usage": _extract_usage(getattr(response, "usage", None)),
                     "model": self.config.model,
+                    "provider": urlparse(str(self.client.base_url)).hostname,
                 },
             )
         except Exception as e:
@@ -306,6 +326,7 @@ class AnthropicProvider(LLMProvider):
                 "assistant_message": assistant_message,
                 "usage": _extract_usage(usage_raw),
                 "model": self.config.model,
+                "provider": urlparse(str(self.client.base_url)).hostname,
             },
         )
 

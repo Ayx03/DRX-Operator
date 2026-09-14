@@ -7,10 +7,9 @@ flat OpenAI-format tool list as built-in tools.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import os
-from typing import Any
 
 from drx_agent.mcp.client import MCPClient, MCPError
 
@@ -24,6 +23,9 @@ class MCPManager:
     def __init__(self, configs: dict[str, dict] | None = None) -> None:
         self._configs: dict[str, dict] = configs or {}
         self.clients: dict[str, MCPClient] = {}
+        self._starting: dict[str, MCPClient] = {}
+        self._closing = False
+        self._close_task: asyncio.Task | None = None
 
     @classmethod
     def from_config_file(cls, path: str) -> "MCPManager":
@@ -47,6 +49,11 @@ class MCPManager:
 
     async def start_all(self) -> None:
         for name, cfg in self._configs.items():
+            if self._closing:
+                return
+            if name in self.clients or name in self._starting:
+                continue
+            client = None
             try:
                 cmd = cfg.get("command")
                 if not cmd:
@@ -60,7 +67,11 @@ class MCPManager:
                     cwd=cfg.get("cwd"),
                     request_timeout=float(cfg.get("timeout", 30.0)),
                 )
+                self._starting[name] = client
                 await client.start()
+                if self._closing:
+                    await client.close()
+                    return
                 self.clients[name] = client
                 logger.info(
                     "MCP server '%s' ready: %d tools (%s)",
@@ -68,18 +79,49 @@ class MCPManager:
                     len(client.tools),
                     client.server_info.get("name", "?"),
                 )
+            except asyncio.CancelledError:
+                await self.close_all()
+                raise
             except MCPError as e:
                 logger.warning("MCP server '%s' disabled: %s", name, e)
             except Exception as e:
                 logger.exception("MCP server '%s' init crashed: %s", name, e)
+            finally:
+                if client is not None and name not in self.clients:
+                    await client.close()
+                self._starting.pop(name, None)
 
     async def close_all(self) -> None:
-        for client in list(self.clients.values()):
+        if self._close_task is None:
+            # No await between admission closure and taking the owned snapshot.
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close_all())
+        cancelled = False
+        while True:
             try:
-                await client.close()
-            except Exception:
-                pass
+                await asyncio.shield(self._close_task)
+                break
+            except asyncio.CancelledError:
+                if self._close_task.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_all(self) -> None:
+        clients = list(self.clients.values()) + list(self._starting.values())
         self.clients.clear()
+        outcomes = await asyncio.gather(
+            *(client.close() for client in clients), return_exceptions=True,
+        )
+        self._starting.clear()
+        failures = [
+            f"{client.name}: {type(outcome).__name__}: {outcome}"
+            for client, outcome in zip(clients, outcomes)
+            if isinstance(outcome, BaseException)
+        ]
+        if failures:
+            raise MCPError("MCP cleanup failed: " + "; ".join(failures))
 
 
     def openai_tool_schemas(self) -> list[dict]:

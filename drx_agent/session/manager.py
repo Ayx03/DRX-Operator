@@ -3,6 +3,7 @@ import time
 
 from drx_agent.agent.knowledge_base import KnowledgeBase
 from drx_agent.session.store import SessionStore
+from drx_agent.session.usage import restore_usage
 
 
 class SessionManager:
@@ -12,7 +13,7 @@ class SessionManager:
     def save(self, kb, messages, active_targets, name="", phase="",
              todos=None, mode="", session_usage=None, frontier=None,
              handoff=None, stage=None, forum=None, claims=None,
-             moderator=None, irc=None, project_note=None) -> str:
+             moderator=None, irc=None, project_note=None, team=None, transcript=None) -> str:
         session_id = str(uuid.uuid4())[:12]
         self.store.save_session(
             session_id=session_id,
@@ -33,6 +34,8 @@ class SessionManager:
                 "moderator": moderator or {},
                 "irc": irc or {},
                 "project_note": project_note or {},
+                "team": team or {},
+                "transcript": transcript,
             },
         )
         return session_id
@@ -44,16 +47,7 @@ class SessionManager:
         kb = KnowledgeBase.from_dict(data["kb_data"])
         meta = data["metadata"]
         extra = meta.get("extra", {})
-        usage = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cache_hit_tokens": 0,
-            "cost_usd": 0.0,
-            "requests": 0,
-            "by_model": {},
-            **extra.get("session_usage", {}),
-        }
+        usage = restore_usage(extra.get("session_usage"))
         return {
             "kb": kb,
             "messages": data["messages"],
@@ -70,6 +64,8 @@ class SessionManager:
             "moderator": extra.get("moderator", {}),
             "irc": extra.get("irc", {}),
             "project_note": extra.get("project_note", {}),
+            "team": extra.get("team", {}),
+            "transcript": extra.get("transcript"),
         }
 
     def checkpoint(self, kb, phase, messages, active_targets) -> str:

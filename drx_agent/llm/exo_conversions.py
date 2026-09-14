@@ -6,10 +6,13 @@ API shapes so the provider stays thin and the conversions stay unit-testable.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from typing import AsyncIterator
 
 from drx_agent.llm.base import AgentEvent, AgentEventType
+from drx_agent.llm.deepseek_provider import _extract_usage
 
 
 def _to_dict(obj) -> dict:
@@ -104,7 +107,7 @@ def _usage_to_dict(usage) -> dict | None:
     u = _to_dict(usage)
     if not u:
         return None
-    out: dict = {}
+    out = dict(u)
     for key, sources in (
         ("prompt_tokens", ("prompt_tokens", "input_tokens")),
         ("completion_tokens", ("completion_tokens", "output_tokens")),
@@ -115,15 +118,13 @@ def _usage_to_dict(usage) -> dict | None:
             if v is not None:
                 out[key] = int(v)
                 break
+    # Responses names its input detail object differently from Chat Completions.
+    if "prompt_tokens_details" not in out:
+        out["prompt_tokens_details"] = u.get("input_tokens_details")
     details = _to_dict(u.get("input_tokens_details"))
-    for out_key, src in (
-        ("prompt_cache_hit_tokens", "cached_tokens"),
-        ("prompt_cache_miss_tokens", "uncached_tokens"),
-    ):
-        v = details.get(src)
-        if v is not None:
-            out[out_key] = int(v)
-    return out or None
+    if out.get("prompt_cache_miss_tokens") is None and details.get("uncached_tokens") is not None:
+        out["prompt_cache_miss_tokens"] = details["uncached_tokens"]
+    return _extract_usage(out)
 
 
 def _output_items_to_events(output_items, finish_reason, usage, model) -> list[AgentEvent]:
@@ -184,30 +185,63 @@ def _parse_sse_data(raw: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-async def parse_sse_lines(lines: AsyncIterator[str]):
-    """Parse EXO's SSE framing (`event:` / `data:` line pairs).
+async def _close_stream(stream) -> None:
+    """Close an owned async source without abandoning cleanup on cancellation."""
+    close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+    if close is None:
+        return
+    closing = close()
+    if not inspect.isawaitable(closing):
+        return
+    task = asyncio.ensure_future(closing)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            # Retrieve the failure below so an earlier cancellation still wins.
+            break
+    try:
+        task.result()
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError
 
-    Yields (event_type, data_dict) tuples. Pure async generator — no network.
-    """
+
+async def parse_sse_lines(lines: AsyncIterator[str]):
+    """Parse EXO's SSE framing and own the underlying line iterator."""
     event_type = "message"
     data_lines: list[str] = []
-    async for raw_line in lines:
-        if raw_line is None:
-            continue
-        line = str(raw_line).rstrip("\r\n")
-        if line == "":
-            if data_lines:
-                yield event_type, _parse_sse_data("".join(data_lines))
-            event_type = "message"
-            data_lines = []
-        elif line.startswith(":"):
-            continue
-        elif line.startswith("event:"):
-            event_type = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[len("data:"):].lstrip())
-    if data_lines:
-        yield event_type, _parse_sse_data("".join(data_lines))
+    source_failed = False
+    try:
+        async for raw_line in lines:
+            if raw_line is None:
+                continue
+            line = str(raw_line).rstrip("\r\n")
+            if line == "":
+                if data_lines:
+                    yield event_type, _parse_sse_data("".join(data_lines))
+                event_type = "message"
+                data_lines = []
+            elif line.startswith(":"):
+                continue
+            elif line.startswith("event:"):
+                event_type = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:"):].lstrip())
+        if data_lines:
+            yield event_type, _parse_sse_data("".join(data_lines))
+    except (Exception, asyncio.CancelledError):
+        source_failed = True
+        raise
+    finally:
+        try:
+            await _close_stream(lines)
+        except Exception:
+            if not source_failed:
+                raise
 
 
 def _sse_event_to_tuple(ev) -> tuple[str, dict]:
@@ -237,76 +271,101 @@ def _sse_event_to_tuple(ev) -> tuple[str, dict]:
 async def _consume_event_stream(
     event_iter: AsyncIterator[tuple[str, dict]], model: str
 ) -> AsyncIterator[AgentEvent]:
-    """Drive the shared stream state machine over (event_type, data) tuples.
+    """Stream deltas, then close at the protocol terminal event, not TCP EOF.
 
-    TEXT deltas stream as they arrive; function calls are accumulated and
-    emitted after the stream completes; DONE carries an OpenAI-chat-format
-    assistant_message.
+    Only completed function-call items are exposed for execution. Failed or
+    truncated responses retain their partial assistant message in ERROR metadata.
     """
     text_parts: list[str] = []
     tool_slots: dict[str, dict] = {}
-    tool_order: list[str] = []
+    tool_order: dict[str, int] = {}
     finish_reason = None
     usage = None
-    error_msg: str | None = None
+    error_msg = "EXO stream ended before a terminal response event"
 
-    async for ev_type, data in event_iter:
-        if ev_type == "response.output_text.delta":
-            delta = data.get("delta") or ""
-            if delta:
-                text_parts.append(delta)
-                yield AgentEvent(type=AgentEventType.TEXT, content=delta)
-        elif ev_type == "response.output_item.done":
-            item = _to_dict(data.get("item"))
-            if item.get("type") == "function_call":
-                call_id = item.get("call_id") or ""
-                if call_id not in tool_slots:
-                    tool_order.append(call_id)
-                tool_slots[call_id] = {
-                    "name": item.get("name") or "",
-                    "arguments": item.get("arguments") or "{}",
-                }
-        elif ev_type == "response.completed":
-            resp = _to_dict(data.get("response")) or data
-            finish_reason = resp.get("status")
-            usage = _usage_to_dict(resp.get("usage"))
-        elif ev_type == "response.failed":
-            resp = _to_dict(data.get("response")) or data
-            err = resp.get("error")
-            error_msg = (
-                str(err.get("message") or err)
-                if isinstance(err, dict)
-                else str(err or "response failed")
+    def record_call(item: dict, output_index=None) -> None:
+        if item.get("type") != "function_call" or item.get("status") not in (None, "completed"):
+            return
+        call_id = item.get("call_id") or ""
+        if isinstance(output_index, int) or call_id not in tool_order:
+            tool_order[call_id] = (
+                output_index if isinstance(output_index, int) else len(tool_order)
             )
+        tool_slots[call_id] = item
 
-    if error_msg:
-        yield AgentEvent(type=AgentEventType.ERROR, content=error_msg)
-        return
+    try:
+        async for ev_type, data in event_iter:
+            if ev_type == "response.output_text.delta":
+                delta = data.get("delta") or ""
+                if delta:
+                    text_parts.append(delta)
+                    yield AgentEvent(type=AgentEventType.TEXT, content=delta)
+            elif ev_type == "response.output_item.done":
+                record_call(_to_dict(data.get("item")), data.get("output_index"))
+            elif ev_type in ("response.completed", "response.failed", "response.incomplete"):
+                resp = _to_dict(data.get("response")) or data
+                finish_reason = resp.get("status") or ev_type.removeprefix("response.")
+                usage = _usage_to_dict(resp.get("usage"))
+                if ev_type == "response.completed" and finish_reason == "completed":
+                    error_msg = ""
+                    for index, raw_item in enumerate(resp.get("output") or []):
+                        record_call(_to_dict(raw_item), index)
+                else:
+                    err = resp.get("error") or resp.get("incomplete_details")
+                    error_msg = (
+                        str(err.get("message") or err)
+                        if isinstance(err, dict)
+                        else str(err or f"response {finish_reason}")
+                    )
+                break
+            elif ev_type == "error":
+                err = data.get("error") or data
+                error_msg = (
+                    str(err.get("message") or err)
+                    if isinstance(err, dict) else str(err)
+                )
+                finish_reason = "failed"
+                break
+    except Exception as exc:
+        error_msg = str(exc) or type(exc).__name__
+    finally:
+        # Consumers often stop after DONE/ERROR; release the source before yield.
+        try:
+            await _close_stream(event_iter)
+        except Exception as exc:
+            # A successful response is not usable until cleanup succeeds. Keep
+            # any primary protocol/transport error and all accumulated output.
+            if not error_msg:
+                error_msg = str(exc) or type(exc).__name__
 
     serialized_calls: list[dict] = []
-    for call_id in tool_order:
+    tool_events: list[AgentEvent] = []
+    for call_id in sorted(tool_order, key=tool_order.get):
         slot = tool_slots[call_id]
         name, parsed = _parse_function_call(slot)
-        yield AgentEvent(
+        tool_events.append(AgentEvent(
             type=AgentEventType.TOOL_CALL,
             tool_name=name,
             tool_input=parsed,
             metadata={"tool_call_id": call_id},
-        )
+        ))
         serialized_calls.append({
             "id": call_id, "type": "function",
-            "function": {"name": name, "arguments": slot["arguments"]},
+            "function": {"name": name, "arguments": slot.get("arguments") or "{}"},
         })
 
     assistant_message: dict = {"role": "assistant", "content": "".join(text_parts)}
     if serialized_calls:
         assistant_message["tool_calls"] = serialized_calls
-    yield AgentEvent(
-        type=AgentEventType.DONE,
-        metadata={
-            "finish_reason": finish_reason,
-            "assistant_message": assistant_message,
-            "usage": usage,
-            "model": model,
-        },
-    )
+    metadata = {
+        "finish_reason": finish_reason,
+        "assistant_message": assistant_message,
+        "usage": usage,
+        "model": model,
+    }
+    if error_msg:
+        yield AgentEvent(type=AgentEventType.ERROR, content=error_msg, metadata=metadata)
+        return
+    for event in tool_events:
+        yield event
+    yield AgentEvent(type=AgentEventType.DONE, metadata=metadata)

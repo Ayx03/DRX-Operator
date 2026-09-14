@@ -11,6 +11,37 @@ from textual.widgets.option_list import Option
 from drx_agent.event_bus import Event, EventBus, EventType
 
 
+def dispatch_command(event_bus: EventBus, cmd: str) -> None:
+    """Dispatch a complete slash command identically from either entry surface."""
+    command = cmd.rstrip()
+    if command == "/help":
+        event_bus.publish(Event(type=EventType.AGENT_MESSAGE, data={
+            "text": (
+                "Commands: /save /resume /target <host> /plan /act /mode "
+                "/memory /memory reload /image <path> [prompt] /scan <host> "
+                "/exploit <host> /status /stop /context /progress /dream "
+                "/roles /team /vote /vote cancel /memory search <query> /memory get <id>"
+            ),
+            "source": "system",
+        }))
+    elif command == "/save":
+        event_bus.publish(Event(type=EventType.SESSION_SAVE, data={}))
+    elif command == "/resume":
+        event_bus.publish(Event(type=EventType.SESSION_RESTORE, data={}))
+    elif cmd.startswith("/image "):
+        rest = cmd[len("/image "):].strip()
+        path, _, prompt = rest.partition(" ")
+        event_bus.publish(Event(
+            type=EventType.AGENT_MESSAGE,
+            data={"source": "user", "text": prompt or "(image attached)", "image_path": path},
+        ))
+    else:
+        event_bus.publish(Event(
+            type=EventType.AGENT_MESSAGE,
+            data={"text": cmd, "source": "user"},
+        ))
+
+
 class CommandPalette(ModalScreen[str | None]):
     """Search descriptions or command names, then explicitly choose with Enter."""
 
@@ -30,12 +61,20 @@ class CommandPalette(ModalScreen[str | None]):
         ("/progress", "查看进度文档（9 段结构）"),
         ("/memory", "查看项目记忆（DRX.md/AGENTS.md/CLAUDE.md）"),
         ("/memory reload", "重新加载项目记忆文件"),
+        ("/memory search", "检索本项目已准入长期经验"),
+        ("/memory get", "读取长期经验原文与来源"),
+        ("/roles", "列出专业角色、工具权限与预算"),
+        ("/team", "查看并发队列、成员和收束状态"),
+        ("/vote", "查看全员投票及缺票成员"),
+        ("/vote cancel", "撤销当前投票并停止征询"),
         ("/save", "保存当前会话"),
         ("/resume", "恢复最近保存的会话"),
         ("/help", "显示命令帮助"),
     ]
 
-    PARAMETER_COMMANDS = frozenset({"/scan", "/exploit", "/target"})
+    PARAMETER_COMMANDS = frozenset({
+        "/scan", "/exploit", "/target", "/memory search", "/memory get",
+    })
 
     BINDINGS = [
         Binding("escape", "pop_screen", "返回", show=False),
@@ -46,21 +85,21 @@ class CommandPalette(ModalScreen[str | None]):
     DEFAULT_CSS = """
     CommandPalette {
         align: center middle;
-        background: #0b1020 85%;
+        background: $background 85%;
     }
     CommandPalette #palette-dialog {
         width: 92%;
         max-width: 80;
         height: 85%;
         max-height: 26;
-        background: #111a2c;
-        border: round #26354b;
+        background: $surface;
+        border: round $panel;
         padding: 0 1;
     }
     CommandPalette #palette-title {
         height: 2;
         content-align: left middle;
-        color: #53d7c3;
+        color: $primary;
         text-style: bold;
     }
     CommandPalette #palette-search {
@@ -70,17 +109,18 @@ class CommandPalette(ModalScreen[str | None]):
     CommandPalette #palette-list {
         height: 1fr;
         border: none;
-        background: #111a2c;
+        background: $surface;
     }
     CommandPalette #palette-hint {
         height: 2;
-        color: #92a4bb;
+        color: $text-muted;
     }
     """
 
     def __init__(self, event_bus: EventBus) -> None:
         super().__init__()
         self.event_bus = event_bus
+        self._answered = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="palette-dialog"):
@@ -94,13 +134,11 @@ class CommandPalette(ModalScreen[str | None]):
         self.query_one("#palette-search", Input).focus()
 
     def on_screen_resume(self) -> None:
-        if self.is_mounted:
-            self.query_one("#palette-search", Input).value = ""
-            self._filter_commands("")
+        if (self.is_mounted and self.is_attached) and self.app.screen is self:
             self.query_one("#palette-search", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "palette-search":
+        if event.input.id == "palette-search" and (self.is_mounted and self.is_attached) and not self._answered:
             self._filter_commands(event.value)
 
     def _filter_commands(self, query: str) -> None:
@@ -124,12 +162,14 @@ class CommandPalette(ModalScreen[str | None]):
         self._move_selection(1)
 
     def _move_selection(self, delta: int) -> None:
+        if self._answered or not (self.is_mounted and self.is_attached) or self.app.screen is not self:
+            return
         palette = self.query_one("#palette-list", OptionList)
         if palette.option_count:
             palette.highlighted = ((palette.highlighted or 0) + delta) % palette.option_count
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "palette-search":
+        if event.input.id == "palette-search" and (self.is_mounted and self.is_attached) and not self._answered and self.app.screen is self:
             event.stop()
             palette = self.query_one("#palette-list", OptionList)
             if palette.highlighted is not None:
@@ -139,29 +179,24 @@ class CommandPalette(ModalScreen[str | None]):
 
     def action_pop_screen(self) -> None:
         """Esc — return to the previous screen without running a command."""
-        self.dismiss(None)
+        if (self.is_mounted and self.is_attached) and self.app.screen is self and not self._answered:
+            self._answered = True
+            self.dismiss(None)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
-        if event.option.id:
+        if event.option_list.id == "palette-list" and event.option.id:
             self._choose_command(event.option.id)
 
     def _choose_command(self, cmd: str) -> None:
+        if self._answered or not (self.is_mounted and self.is_attached) or self.app.screen is not self:
+            return
+        if cmd not in {command for command, _ in self.SLASH_COMMANDS}:
+            return
+        self._answered = True
         if cmd in self.PARAMETER_COMMANDS:
             self.dismiss(cmd + " ")
         else:
-            self._execute_command(cmd)
+            # Pop this screen before a synchronous subscriber can open a modal.
             self.dismiss(None)
-
-    def _execute_command(self, cmd: str) -> None:
-        if cmd in self.PARAMETER_COMMANDS:
-            return
-        if cmd == "/save":
-            self.event_bus.publish(Event(type=EventType.SESSION_SAVE, data={}))
-        elif cmd == "/resume":
-            self.event_bus.publish(Event(type=EventType.SESSION_RESTORE, data={}))
-        else:
-            self.event_bus.publish(Event(
-                type=EventType.AGENT_MESSAGE,
-                data={"text": cmd, "source": "user"},
-            ))
+            dispatch_command(self.event_bus, cmd)

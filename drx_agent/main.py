@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from drx_agent.event_bus import EventBus, Event, EventType
 from drx_agent.tui.app import DrxAgentApp
+from drx_agent.tui.transcript import TranscriptLog
 from drx_agent.safety.gate import SafetyGate
 from drx_agent.agent.knowledge_base import KnowledgeBase
 from drx_agent.agent.task_scheduler import TaskScheduler, TaskPriority, ScheduledTask
@@ -21,8 +22,10 @@ from drx_agent.agent.master import MasterAgent
 from drx_agent.engine.python_sandbox import PythonSandbox
 from drx_agent.engine.bash_sandbox import BashSandbox
 from drx_agent.engine.script_library import ScriptLibrary
+from drx_agent.engine.process import cancel_task
 from drx_agent.skills.registry import SkillsRegistry
 from drx_agent.session.manager import SessionManager
+from drx_agent.session.usage import usage_status
 from drx_agent.agent.frontier import Frontier
 from drx_agent.agent.handoff import Handoff
 from drx_agent.agent.stage import StageMachine
@@ -227,6 +230,7 @@ class DrxAgent:
 
     def __init__(self):
         self.event_bus = EventBus()
+        self.transcript = TranscriptLog(self.event_bus)
 
         self.safety_gate = SafetyGate()
 
@@ -235,6 +239,7 @@ class DrxAgent:
         self.python_sandbox = PythonSandbox()
         # Config overrides: bash.whitelist null → everything allowed; [...] → exact list; extra_whitelist → append.
         bash_whitelist = list(self.BASH_WHITELIST)
+        cfg = {}
         try:
             cfg_path = _config_path()
             with open(cfg_path, "r", encoding="utf-8") as fp:
@@ -252,7 +257,17 @@ class DrxAgent:
         self.script_library = ScriptLibrary()
         self.skills_registry = SkillsRegistry()
 
-        self.scheduler = TaskScheduler()
+        collaboration = cfg.get("collaboration", {})
+        if not isinstance(collaboration, dict):
+            raise ValueError("collaboration configuration must be an object")
+        scheduler_config = collaboration.get("scheduler", {})
+        if not isinstance(scheduler_config, dict):
+            raise ValueError("collaboration.scheduler must be an object")
+        self.scheduler = TaskScheduler(
+            max_concurrent_per_target=scheduler_config.get("max_concurrent_per_target", 4),
+            max_concurrent=scheduler_config.get("max_concurrent", 16),
+            global_qps=scheduler_config.get("global_qps"),
+        )
 
         session_dir = os.path.join(os.path.dirname(__file__), "..", "sessions")
         self.session_manager = SessionManager(storage_dir=os.path.abspath(session_dir))
@@ -261,6 +276,7 @@ class DrxAgent:
 
         cfg_path = _config_path()
         self.mcp_manager = MCPManager.from_config_file(cfg_path)
+        self._setup_task: asyncio.Task | None = None
 
         self.hooks = HookManager()
         try:
@@ -282,6 +298,7 @@ class DrxAgent:
             llm_provider=self.llm_provider,
             mcp_manager=self.mcp_manager,
             hooks=self.hooks,
+            collaboration_config=collaboration,
         )
 
         try:
@@ -299,7 +316,17 @@ class DrxAgent:
 
     async def async_setup(self) -> None:
         """One-time async startup: connect MCP servers, etc."""
-        await self.mcp_manager.start_all()
+        if self.master._closing:
+            return
+        if getattr(self, "_setup_task", None) is None:
+            self._setup_task = asyncio.create_task(self.mcp_manager.start_all())
+        try:
+            await asyncio.shield(self._setup_task)
+        except asyncio.CancelledError:
+            if not self._setup_task.done():
+                cancel_task(self._setup_task)
+            await asyncio.gather(self._setup_task, return_exceptions=True)
+            raise
         if self.mcp_manager.clients:
             count = sum(len(c.tools) for c in self.mcp_manager.clients.values())
             self.event_bus.publish(Event(
@@ -311,8 +338,16 @@ class DrxAgent:
             ))
 
     async def async_teardown(self) -> None:
-        self.master.shutdown()
-        await self.mcp_manager.close_all()
+        self.master._closing = True
+        setup = getattr(self, "_setup_task", None)
+        try:
+            if setup is not None:
+                if not setup.done():
+                    cancel_task(setup)
+                await asyncio.gather(setup, return_exceptions=True)
+            await self.master.async_shutdown()
+        finally:
+            await self.mcp_manager.close_all()
 
     def _load_skills(self):
         skills_dir = os.path.join(os.path.dirname(__file__), "..", "skills")
@@ -325,40 +360,34 @@ class DrxAgent:
                     data={"text": f"Loaded {loaded} skills"}
                 ))
 
+    def save_session(self) -> str:
+        """Persist the current snapshot, propagating errors to the caller."""
+        return self.session_manager.save(
+            kb=self.knowledge_base,
+            messages=self.master.messages,
+            active_targets=[t["host"] for t in self.knowledge_base.list_targets()],
+            name=f"session-{len(self.master.messages)}msgs",
+            todos=self.master.todos,
+            mode=self.master.mode,
+            session_usage=self.master.session_usage,
+            frontier=self.master.frontier.to_dict(),
+            handoff=self.master.handoff.to_dict() if self.master.handoff is not None else None,
+            stage=self.master.stage_machine.to_dict(),
+            forum=self.master.forum.to_dict(),
+            claims=self.master.claims.to_dict(),
+            moderator=self.master.moderator.to_dict(),
+            irc=self.master.irc.to_dict(),
+            project_note=self.master.project_note.to_dict(),
+            team=self.master._export_team_state(),
+            transcript=self.transcript.export(),
+        )
+
     def _setup_session_handlers(self):
         def handle_save(event: Event):
+            if self.master._closing:
+                return
             try:
-                sid = self.session_manager.save(
-                    kb=self.knowledge_base,
-                    messages=getattr(self.master, 'messages', []),
-                    active_targets=[t["host"] for t in self.knowledge_base.list_targets()],
-                    name=f"session-{len(getattr(self.master, 'messages', []))}msgs",
-                    todos=getattr(self.master, 'todos', []),
-                    mode=getattr(self.master, 'mode', 'act'),
-                    session_usage=getattr(self.master, 'session_usage', {}),
-                    frontier=getattr(self.master, 'frontier', Frontier()).to_dict(),
-                    handoff=(
-                        getattr(self.master, 'handoff', None).to_dict()
-                        if getattr(self.master, 'handoff', None) is not None
-                        else None
-                    ),
-                    stage=getattr(self.master, 'stage_machine', StageMachine()).to_dict(),
-                    forum=getattr(self.master, 'forum', None).to_dict()
-                    if getattr(self.master, 'forum', None) is not None
-                    else None,
-                    claims=getattr(self.master, 'claims', None).to_dict()
-                    if getattr(self.master, 'claims', None) is not None
-                    else None,
-                    moderator=getattr(self.master, 'moderator', None).to_dict()
-                    if getattr(self.master, 'moderator', None) is not None
-                    else None,
-                    irc=getattr(self.master, 'irc', None).to_dict()
-                    if getattr(self.master, 'irc', None) is not None
-                    else None,
-                    project_note=getattr(self.master, 'project_note', None).to_dict()
-                    if getattr(self.master, 'project_note', None) is not None
-                    else None,
-                )
+                sid = self.save_session()
                 self.event_bus.publish(Event(
                     type=EventType.AGENT_MESSAGE,
                     data={
@@ -387,30 +416,51 @@ class DrxAgent:
                     ))
                     return
                 latest = sessions[0]
+                restored = self.session_manager.restore(latest["id"])
+                if restored is None:
+                    raise ValueError("Restore returned no data")
+                if (not isinstance(restored["todos"], list)
+                        or any(not isinstance(todo, dict) for todo in restored["todos"])):
+                    raise ValueError("Saved todos must be a list of objects")
+                if restored["mode"] not in ("act", "plan"):
+                    raise ValueError("Invalid saved operating mode")
+
+                # Validate every replacement, including display history, without
+                # disturbing live producers or an outstanding approval.
+                from drx_agent.agent.forum import Forum
+                from drx_agent.agent.claims import ClaimRegistry
+                from drx_agent.agent.moderator import Moderator
+                from drx_agent.agent.irc import IRC
+                from drx_agent.agent.project_note import ProjectNote
+
+                frontier = Frontier.from_dict(
+                    restored["frontier"], max_intents=self.master.frontier.max_intents,
+                )
+                frontier.reconcile_restored()
+                raw_handoff = restored["handoff"]
+                handoff = Handoff.from_dict(raw_handoff) if raw_handoff else None
+                stage = StageMachine.from_dict(restored["stage"])
+                forum = Forum.from_dict(restored["forum"])
+                claims = ClaimRegistry.from_dict(restored["claims"])
+                moderator = Moderator.from_dict(restored["moderator"])
+                irc = IRC.from_dict(restored["irc"])
+                project_note = ProjectNote.from_dict(restored["project_note"])
+                ballot, members, run_id = self.master._decode_team_state(
+                    restored["team"], stage=stage.stage.value,
+                )
+                candidate = TranscriptLog(EventBus())
+                try:
+                    candidate.restore_messages(restored["messages"])
+                    if restored["transcript"] is not None:
+                        candidate.restore(restored["transcript"])
+                    history = candidate.export()
+                finally:
+                    candidate.close()
+
                 await self.master.prepare_restore()
                 try:
-                    restored = self.session_manager.restore(latest["id"])
-                    if restored is None:
-                        raise ValueError("Restore returned no data")
-
-                    # Construct the complete replacement before changing live state.
-                    # No await is allowed between preparation and finish_restore.
-                    from drx_agent.agent.forum import Forum
-                    from drx_agent.agent.claims import ClaimRegistry
-                    from drx_agent.agent.moderator import Moderator
-                    from drx_agent.agent.irc import IRC
-                    from drx_agent.agent.project_note import ProjectNote
-
-                    frontier = Frontier.from_dict(restored["frontier"])
-                    frontier.reconcile_restored()
-                    raw_handoff = restored["handoff"]
-                    handoff = Handoff.from_dict(raw_handoff) if raw_handoff else None
-                    stage = StageMachine.from_dict(restored["stage"])
-                    forum = Forum.from_dict(restored["forum"])
-                    claims = ClaimRegistry.from_dict(restored["claims"])
-                    moderator = Moderator.from_dict(restored["moderator"])
-                    irc = IRC.from_dict(restored["irc"])
-                    project_note = ProjectNote.from_dict(restored["project_note"])
+                    # No await between the successful preflight barrier and commit.
+                    self.transcript.restore(history)
 
                     self.knowledge_base = restored["kb"]
                     self.master.knowledge_base = restored["kb"]
@@ -426,9 +476,17 @@ class DrxAgent:
                     self.master.project_note = project_note
                     self.master.mode = restored["mode"]
                     self.master.session_usage = restored["session_usage"]
+                    self.master._recent_request_ts.clear()
+                    self.master.ballot = ballot
+                    self.master._team_members = members
+                    self.master._run_id = run_id
                 finally:
                     self.master.finish_restore()
 
+                self.event_bus.publish(Event(
+                    type=EventType.SESSION_RESTORED,
+                    data={"session_id": latest["id"]},
+                ))
                 self.event_bus.publish(Event(
                     type=EventType.STATUS_UPDATE,
                     data={"tasks": [
@@ -439,6 +497,8 @@ class DrxAgent:
                 self.event_bus.publish(Event(
                     type=EventType.STATUS_UPDATE,
                     data={
+                        **usage_status(self.master.session_usage),
+                        "rate": 0,
                         "mode": self.master.mode,
                         "active_targets": len(self.knowledge_base.list_targets()),
                     },
@@ -469,13 +529,14 @@ class DrxAgent:
         )
 
 
-def main():
+def main() -> int:
     """Entry point — create agent and launch TUI."""
     agent = DrxAgent()
     app = DrxAgentApp(agent.event_bus, drx_agent=agent)
     app.run()
+    return app.return_code or 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
