@@ -28,6 +28,7 @@ from drx_agent.agent.artifact_store import ArtifactStore
 from drx_agent.agent.evidence import EvidenceStore, VALID_ORIGINS
 from drx_agent.agent.prompts import METHODOLOGY_PROMPT, SUB_AGENT_DISCIPLINE
 from drx_agent.agent.sub_agent import SubAgent, SubAgentResult, SubAgentStatus
+from drx_agent.agent.steering import MessageInterrupt, MessageSignal, is_message_interrupt
 from drx_agent.agent.frontier import Frontier
 from drx_agent.agent.handoff import Handoff
 from drx_agent.agent.stage import StageMachine
@@ -309,6 +310,12 @@ class MasterAgent:
         self.active_sub_agents: dict[str, SubAgent] = {}
         self._worker_runners: set[asyncio.Task] = set()
         self.active_sub_agent_tasks: dict[str, asyncio.Task] = {}
+        self._resident_workers: dict[str, SubAgent] = {}
+        self._resident_tool_grants: dict[str, list[dict]] = {}
+        self._mail_tasks: dict[str, asyncio.Task] = {}
+        self._message_signal = MessageSignal()
+        self._interrupt_epoch = 0
+        self._mail_paused = False
         self.frontier: Frontier = Frontier(max_intents=config.get("max_intents", 512))
         self.handoff: Handoff | None = None
         self.stage_machine: StageMachine = StageMachine()
@@ -320,6 +327,7 @@ class MasterAgent:
         self.project_note: ProjectNote = ProjectNote()
         self._notification_cursors: dict[str, dict[str, int]] = {}
         self._actor: ContextVar[str] = ContextVar("master_tool_actor", default="master")
+        self._tool_handoffs: ContextVar[list[str] | None] = ContextVar("tool_handoffs", default=None)
         self._worker_claims: dict[str, dict[str, float]] = {}
         self._lease_interval = 1.0
         self._restore_lock = asyncio.Lock()
@@ -419,11 +427,16 @@ class MasterAgent:
         self.event_bus.subscribe(
             EventType.APPROVAL_RESPONSE, self._on_approval_response
         )
+        self._bind_irc_delivery()
 
 
     async def start(self) -> None:
         
         self.running = True
+        self._interrupt = False
+        self._mail_paused = False
+        for actor in ("master", *self._resident_workers):
+            self._queue_mail(actor)
         self.event_bus.publish(
             Event(
                 type=EventType.STATUS_UPDATE,
@@ -484,10 +497,11 @@ class MasterAgent:
 
 
         if text in ("/stop", "/cancel", "/interrupt"):
-            if self._chat_active or self.active_sub_agents or self._vote_tasks:
+            if self._chat_active or self.active_sub_agents or self._vote_tasks or self._mail_tasks:
                 self._signal_interrupt()
                 self.publish_action("⏹ 已请求停止当前任务…")
             else:
+                self._mail_paused = True
                 self.publish_action("当前没有正在运行的任务。")
             return
 
@@ -1151,10 +1165,22 @@ class MasterAgent:
         ]
 
     def _export_team_state(self) -> dict:
-        return {"namespace": self.memory_namespace, "run_id": self._run_id,
-                "members": list(self._team_members.values()), "ballot": self.ballot.to_dict()}
+        residents = {
+            actor: {
+                "role": sub.agent_type, "target": sub.target, "task": sub.task,
+                "status": sub.status.value, "system_prompt": sub.system_prompt,
+                "tool_names": [schema["function"]["name"] for schema in self._resident_tool_grants[actor]],
+                "runtime": sub.snapshot_runtime(),
+            }
+            for actor, sub in self._resident_workers.items()
+        }
+        return {
+            "namespace": self.memory_namespace, "run_id": self._run_id,
+            "members": list(self._team_members.values()), "ballot": self.ballot.to_dict(),
+            "residents": residents,
+        }
 
-    def _decode_team_state(self, data: dict, *, stage: str | None = None) -> tuple[TeamBallot, dict, str]:
+    def _decode_team_state(self, data: dict, *, stage: str | None = None) -> tuple[TeamBallot, dict, str, dict]:
         if not isinstance(data, dict):
             raise ValueError("invalid saved team state")
         stage = stage or self.stage_machine.stage.value
@@ -1192,7 +1218,54 @@ class MasterAgent:
             raise ValueError("saved ballot does not match the stage electorate")
         if interrupted_members:
             ballot.invalidate("session restore interrupted unfinished team work")
-        return ballot, members, str(data.get("run_id") or uuid.uuid4().hex)
+        raw_residents = data.get("residents", {})
+        if not isinstance(raw_residents, dict):
+            raise ValueError("invalid saved resident registry")
+        residents = {}
+        schemas = self._build_tool_schemas()
+        for actor, saved in raw_residents.items():
+            if not isinstance(actor, str) or not actor or actor == "master" or not isinstance(saved, dict):
+                raise ValueError("invalid saved resident identity")
+            if any(not isinstance(saved.get(key), str) for key in
+                   ("role", "target", "task", "status", "system_prompt")):
+                raise ValueError("invalid saved resident context")
+            profile = self.roles.get(saved["role"])
+            names = saved.get("tool_names")
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                raise ValueError("invalid saved resident tool grants")
+            runtime = SubAgent.validate_runtime(saved.get("runtime"))
+            status = SubAgentStatus(saved["status"])
+            if status in (SubAgentStatus.RUNNING, SubAgentStatus.QUEUED):
+                status = SubAgentStatus.CANCELLED
+            if actor in members and any(
+                saved[key] != members[actor][key] for key in ("role", "target", "task")
+            ):
+                raise ValueError("saved resident does not match its team identity")
+            allowed = set(names)
+            sub = SubAgent(
+                profile.name, saved["target"], saved["task"], self.event_bus,
+                llm_provider=self.llm_provider, tool_executor=self._execute_tool,
+                tool_schemas=[schema for schema in schemas if schema["function"]["name"] in allowed],
+                system_prompt=saved["system_prompt"], ttl=profile.ttl,
+                max_iterations=profile.max_iterations, usage_callback=self._record_usage,
+                llm_call_timeout=self.llm_call_timeout,
+                parallel_tool_calls=profile.parallel_tool_calls,
+            )
+            sub.agent_id = actor
+            sub.messages = runtime["messages"]
+            if not sub.messages:
+                sub.messages = [
+                    {"role": "system", "content": sub.system_prompt},
+                    {"role": "user", "content": (
+                        "会话已恢复，原任务未安排恢复执行，仅保留为背景：\n"
+                        f"{sub.task}\n只处理新收到的定向消息；不要自行重做原任务。"
+                    )},
+                ]
+            sub.activation = runtime["activation"]
+            sub._interrupt = runtime["stopped"]
+            sub.status = status
+            residents[actor] = sub
+        return ballot, members, str(data.get("run_id") or uuid.uuid4().hex), residents
 
     def _build_tool_schemas(self) -> list[dict]:
         
@@ -2410,8 +2483,9 @@ class MasterAgent:
                 "function": {
                     "name": "irc_send",
                     "description": (
-                        "向指定 agent 发送一条定向点对点消息（IRC）。无广播、无话题、"
-                        "无线程，只有收件人能回复；回复后原消息标记为已答。"
+                        "向指定 agent 发送定向消息。team_status.roster 可查当前会话的成员。"
+                        "运行中成员会清理当前等待后处理来信；已完成成员受调度限制唤醒续跑。"
+                        "显式停止的成员不自动唤醒。只有收件人可用 irc_reply 回答并结束原请求。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -2642,6 +2716,7 @@ class MasterAgent:
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         actor = self._actor.get()
+        interrupt_epoch = self._interrupt_epoch
         self._script_counter += 1
         call_seq = self._script_counter
         details = {"tool": name, "agent_id": actor, "call_seq": call_seq, "input": args}
@@ -2652,6 +2727,8 @@ class MasterAgent:
             self.event_bus.publish(Event(EventType.TOOL_CALL, {
                 **details, "code": json.dumps(args, ensure_ascii=False), "status": "running",
             }))
+            handoffs: list[str] = []
+            handoff_token = self._tool_handoffs.set(handoffs)
             try:
                 result = await self._execute_tool_impl(name, args, call_seq, output)
                 output.setdefault("output", result)
@@ -2667,6 +2744,14 @@ class MasterAgent:
                     pass
                 return result
             except asyncio.CancelledError:
+                if (handoffs and interrupt_epoch == self._interrupt_epoch
+                        and not self._mail_paused and not self._closing and not self._restoring):
+                    status = "done"
+                    output["output"] = json.dumps({
+                        "status": "background", "agent_ids": handoffs,
+                        "message": "Workers continue under runtime ownership; results arrive as directed notifications.",
+                    })
+                    return output["output"]
                 status = "cancelled"
                 output["output"] = "Tool interrupted"
                 raise
@@ -2674,6 +2759,7 @@ class MasterAgent:
                 output["output"] = str(exc)
                 raise
             finally:
+                self._tool_handoffs.reset(handoff_token)
                 self.event_bus.publish(Event(EventType.TOOL_RESULT, {
                     **details, "status": status, "output": output.get("output", ""),
                 }))
@@ -3934,8 +4020,10 @@ class MasterAgent:
                     "stalled_workers": metrics.stalled_workers,
                     "roster": [
                         {"agent_id": sub.agent_id, "type": sub.agent_type,
-                         "target": sub.target, "status": sub.status.value}
-                        for sub in self.active_sub_agents.values()
+                         "target": sub.target, "status": sub.status.value,
+                         "activation": sub.activation,
+                         "wakeable": not sub._interrupt and not self._mail_paused}
+                        for sub in self._resident_workers.values()
                     ],
                     "forum_pending": self.forum.pending(None if actor == "master" else actor),
                     "irc_pending_count": len(pending_irc),
@@ -4501,16 +4589,19 @@ class MasterAgent:
 
     def _wire_worker(
         self, sub: SubAgent, intent_id: str | None = None, *, role_name: str | None = None,
+        bind_prompt: bool = True,
     ) -> None:
         """Bind the runtime identity once; neither arguments nor sibling tasks can replace it."""
         generation = self._session_generation
         frontier = self.frontier
         profile = self.roles.get(role_name or sub.agent_type)
         sub.agent_type = profile.name
-        sub.tool_schemas = self.stage_machine.filter_schemas(profile.filter_schemas([
+        grants = profile.filter_schemas([
             t for t in sub.tool_schemas if t["function"]["name"] not in self._MASTER_ONLY_TOOLS
-        ]))
-        allowed = {t["function"]["name"] for t in sub.tool_schemas}
+        ])
+        self._resident_tool_grants[sub.agent_id] = grants
+        sub.tool_schemas = self.stage_machine.filter_schemas(grants)
+        allowed = {t["function"]["name"] for t in grants}
 
         async def execute(name: str, args: dict) -> str:
             if generation != self._session_generation or self._restoring or sub._interrupt:
@@ -4529,23 +4620,107 @@ class MasterAgent:
                 self._actor.reset(token)
 
         sub.tool_executor = execute
+        self._resident_workers[sub.agent_id] = sub
+        if bind_prompt:
+            self._bind_worker_prompt(sub)
+        sub.notification_provider = lambda: self._pack_notifications(sub.agent_id)
+
+    def _bind_worker_prompt(self, sub: SubAgent) -> None:
         sub.system_prompt += (
             f"\n\n你的真实 agent_id={sub.agent_id}；发送给主控使用 to=master。"
             "身份由运行时绑定，不接受 author/owner/agent_id 参数。"
             "先 claim_acquire 再做共享工作，结束释放；已派发意图由主控自动续租。"
             "topic 普通公开消息需 forum_subscribe 订阅；未决义务用 forum_pending/irc_pending。"
+            "定向问题必须用 irc_reply(message_id, content) 回答；返回最终总结不等于已回复。"
+            "你可能在同一身份和私有历史中因新消息再次运行；不要重做已有工具副作用，"
+            "只处理新增请求。工具权限以当前提供的列表和执行端检查为准。\n"
             "通知摘要不替代原文，长消息请按提示读取；完成自己的任务后返回结果，不关闭整个团队。\n"
             + self.forum.render_for(sub.agent_id)
         )
         sub.system_prompt += self._render_long_term_memory(sub.task)
-        sub.notification_provider = lambda: self._pack_notifications(sub.agent_id)
+
+    def _bind_irc_delivery(self) -> None:
+        channel = self.irc
+        channel.on_message = lambda message: self._receive_irc(channel, message.to_agent)
+
+    def _receive_irc(self, channel: IRC, actor: str) -> None:
+        if channel is not self.irc or self._closing or self._restoring:
+            return
+        if actor == "master":
+            self._message_signal.notify()
+        else:
+            sub = self._resident_workers.get(actor)
+            if sub is None or sub._interrupt:
+                return
+            sub.request_message()
+        self._queue_mail(actor)
+
+    def _queue_mail(self, actor: str) -> None:
+        if (self._closing or self._restoring or self._mail_paused
+                or actor in self._mail_tasks or not self.irc.unread_count(actor)):
+            return
+        if actor == "master":
+            if self._chat_active or self._chat_requests or self.llm_provider is None:
+                return
+        else:
+            sub = self._resident_workers.get(actor)
+            if (sub is None or sub._interrupt or actor in self.active_sub_agents
+                    or sub.status in (SubAgentStatus.RUNNING, SubAgentStatus.QUEUED)):
+                return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        generation = self._session_generation
+        task = loop.create_task(self._run_mail(actor, generation))
+        self._mail_tasks[actor] = task
+        self._scheduled_tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            self._scheduled_tasks.discard(done)
+            if self._mail_tasks.get(actor) is not done:
+                return
+            self._mail_tasks.pop(actor, None)
+            if done.cancelled():
+                if generation == self._session_generation:
+                    self._queue_mail(actor)
+                return
+            error = done.exception()
+            if error is not None:
+                self.event_bus.publish(Event(EventType.ERROR, {
+                    "message": f"Message delivery to {actor} failed: {error}",
+                }))
+                return
+            if generation == self._session_generation:
+                if actor != "master" and done.result() is not None:
+                    self._deliver_worker_result(done, self._resident_workers[actor], generation)
+                self._queue_mail(actor)
+
+        task.add_done_callback(finished)
+
+    async def _run_mail(self, actor: str, generation: int) -> SubAgentResult | None:
+        if (generation != self._session_generation or self._closing
+                or self._restoring or self._mail_paused):
+            return
+        if actor == "master":
+            await self._chat_with_llm("", _skip_user_message=True)
+        else:
+            sub = self._resident_workers.get(actor)
+            if sub is None or sub._interrupt:
+                return
+            sub.tool_schemas = self.stage_machine.filter_schemas(
+                self.roles.get(sub.agent_type).filter_schemas(self._resident_tool_grants[actor])
+            )
+            return await self._run_worker(
+                sub, work_item=f"mail:{actor}", generation=generation,
+            )
 
     def _pack_notifications(self, actor: str) -> str:
         """Two independent FIFO lanes: a busy forum cannot starve IRC answers."""
         cursors = self._notification_cursors.setdefault(actor, {"forum": 0, "irc": 0})
         lanes = (
             ("forum", self.forum.wait(actor, after_id=cursors["forum"], limit=20)),
-            ("irc", self.irc.inbox(actor, after_id=cursors["irc"], limit=20)),
+            ("irc", self.irc.inbox(actor, unread_only=True, after_id=cursors["irc"], limit=20)),
         )
         parts = []
         for channel, messages in lanes:
@@ -4594,7 +4769,56 @@ class MasterAgent:
         self, sub: SubAgent, intent_id: str | None = None, *,
         work_item: str | None = None, generation: int | None = None,
     ) -> SubAgentResult:
+        """A mail interruption transfers the wait, never the child's lifetime."""
+        generation = self._session_generation if generation is None else generation
+        interrupt_epoch = self._interrupt_epoch
+        task = asyncio.create_task(self._run_worker_owned(
+            sub, intent_id, work_item=work_item, generation=generation,
+        ))
+        self._scheduled_tasks.add(task)
+        task.add_done_callback(self._scheduled_tasks.discard)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if (is_message_interrupt() and interrupt_epoch == self._interrupt_epoch
+                    and not sub._interrupt and not self._mail_paused
+                    and not self._restoring and not self._closing):
+                handoffs = self._tool_handoffs.get()
+                if handoffs is not None:
+                    handoffs.append(sub.agent_id)
+                task.add_done_callback(
+                    lambda done: self._deliver_worker_result(done, sub, generation)
+                )
+            else:
+                cancel_task(task)
+                drain = asyncio.gather(task, return_exceptions=True)
+                while not drain.done():
+                    try:
+                        await asyncio.shield(drain)
+                    except asyncio.CancelledError:
+                        pass
+            raise
+
+    def _deliver_worker_result(self, task: asyncio.Task, sub: SubAgent, generation: int) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if generation != self._session_generation or self._closing or self._restoring:
+            return
+        result = task.result() if error is None else None
+        self.irc.send(sub.agent_id, "master", json.dumps({
+            "kind": "worker_result", "agent_id": sub.agent_id,
+            "status": result.status.value if result else "error",
+            "text": result.text if result else "", "error": result.error if result else str(error),
+        }, ensure_ascii=False), terminal=True)
+
+    async def _run_worker_owned(
+        self, sub: SubAgent, intent_id: str | None = None, *,
+        work_item: str | None = None, generation: int | None = None,
+    ) -> SubAgentResult:
+        sub.status = SubAgentStatus.QUEUED
         sub.queue()
+        activation = sub.activation
         result = None
         try:
             result = await self._run_worker_lifecycle(
@@ -4602,7 +4826,7 @@ class MasterAgent:
             )
             return result
         finally:
-            if sub.started_at is None:
+            if sub.activation == activation:
                 if result is None:
                     result = SubAgentResult(
                         agent_id=sub.agent_id, status=SubAgentStatus.CANCELLED,
@@ -4616,6 +4840,7 @@ class MasterAgent:
                     "error" if result and result.status in {SubAgentStatus.ERROR, SubAgentStatus.TIMEOUT}
                     else "cancelled",
                 )
+            self._queue_mail(sub.agent_id)
 
     async def _run_worker_lifecycle(
         self, sub: SubAgent, intent_id: str | None = None, *,
@@ -4716,12 +4941,7 @@ class MasterAgent:
             "完成后返回简洁结论；失败如实汇报。"
         )
         sub_system += "\n" + self.blackboard.render(1500) + "\n"
-        tools = self.stage_machine.filter_schemas(
-            [
-                t for t in self._build_tool_schemas()
-                if t["function"]["name"] not in ("task", "intent_batch")
-            ]
-        )
+        tools = self._build_tool_schemas()
 
 
         ctx = self._build_context_pack(
@@ -6200,7 +6420,12 @@ class MasterAgent:
                 return
             self.publish_action("💤 做梦中：二次剪枝 + 整合进度文档…")
             if self._progress_doc:
-                tighter = await self._update_progress_doc(self._progress_doc, [])
+                try:
+                    tighter = await self._message_signal.run(
+                        self._update_progress_doc(self._progress_doc, []),
+                    )
+                except MessageInterrupt:
+                    return
                 if tighter:
                     self._progress_doc = tighter
 
@@ -6208,7 +6433,9 @@ class MasterAgent:
             saved = self.context_token_limit
             self.context_token_limit = 1
             try:
-                await self._maybe_compact_context()
+                await self._message_signal.run(self._maybe_compact_context())
+            except MessageInterrupt:
+                return
             finally:
                 self.context_token_limit = saved
 
@@ -6314,6 +6541,13 @@ class MasterAgent:
             self._intent_agent_map.clear()
             self._worker_claims.clear()
             self._notification_cursors.clear()
+            self._mail_tasks.clear()
+            self._message_signal = MessageSignal()
+            self._mail_paused = False
+            self._bind_irc_delivery()
+            self._resident_tool_grants.clear()
+            for sub in self._resident_workers.values():
+                self._wire_worker(sub, bind_prompt=False)
             self._last_moderator_render = ""
             self._pending_observer_msg = None
             self._operator_query = ""
@@ -6328,7 +6562,14 @@ class MasterAgent:
             self._restore_lock.release()
 
     def _signal_interrupt(self) -> None:
+        self._interrupt_epoch += 1
         self._interrupt = True
+        self._mail_paused = True
+        for actor, task in tuple(self._mail_tasks.items()):
+            sub = self._resident_workers.get(actor)
+            if sub is not None:
+                sub.request_stop()
+            cancel_task(task)
         for data in tuple(self.event_bus.activities.values()):
             self.event_bus.publish(Event(EventType.ACTIVITY_UPDATE, {**data, "state": "stopping"}))
         self.ballot.invalidate("team interrupted")
@@ -6409,6 +6650,7 @@ class MasterAgent:
                     return
                 self._chat_active = True
                 self._interrupt = False
+                self._mail_paused = False
                 self._chat_task = task
                 token = self._actor.set("master")
                 try:
@@ -6421,6 +6663,7 @@ class MasterAgent:
                     self._actor.reset(token)
         finally:
             self._chat_requests.discard(task)
+            self._queue_mail("master")
 
     def _maybe_tick_moderator(self) -> None:
         try:
@@ -6468,8 +6711,15 @@ class MasterAgent:
             if self._interrupt:
                 self.publish_action(f"⏹ 已在第 {iteration} 步停止当前任务。")
                 return
+            self._message_signal.acknowledge()
+            notifications = self._pack_notifications("master")
+            if notifications:
+                self.messages.append({"role": "user", "content": notifications})
             iteration += 1
-            await self._maybe_compact_context()
+            try:
+                await self._message_signal.run(self._maybe_compact_context())
+            except MessageInterrupt:
+                continue
             if (
                 self.iteration_soft_threshold > 0
                 and iteration > next_checkpoint
@@ -6489,7 +6739,10 @@ class MasterAgent:
                 )
                 self._pending_observer_msg = None
             if self.swarm_mode and self._current_intent_id is None:
-                summary = await self._dispatch_frontier_batch()
+                try:
+                    summary = await self._message_signal.run(self._dispatch_frontier_batch())
+                except MessageInterrupt:
+                    continue
                 if summary:
                     lines = "\n".join(
                         f"- [{r['status']}] {r['hypothesis']}: "
@@ -6509,6 +6762,7 @@ class MasterAgent:
             notifications = self._pack_notifications("master")
             if notifications:
                 self.messages.append({"role": "user", "content": notifications})
+            self._message_signal.acknowledge()
             self._append_runtime_context()
             collaborative = bool(
                 self.frontier._intents or self.active_sub_agents or self._team_members
@@ -6564,7 +6818,15 @@ class MasterAgent:
                                 if kind_value == "error":
                                     error_seen = ev.content or "unknown LLM error"
                                 break
-                await asyncio.wait_for(_consume(), timeout=self.llm_call_timeout)
+                await self._message_signal.run(_consume(), timeout=self.llm_call_timeout)
+            except MessageInterrupt:
+                partial = "".join(text_parts)
+                if partial:
+                    self.messages.append({"role": "assistant", "content": partial})
+                    if not stream_opened:
+                        self._publish_stream_delta(stream_id, partial, False)
+                    self._publish_stream_end(stream_id, partial)
+                continue
             except asyncio.CancelledError:
                 if stream_opened:
                     self._publish_stream_end(stream_id)
@@ -6593,6 +6855,13 @@ class MasterAgent:
 
             raw_text = "".join(text_parts)
             text_reply = raw_text.strip()
+            if self._message_signal.pending and not error_seen:
+                if raw_text:
+                    self.messages.append({"role": "assistant", "content": raw_text})
+                    if not stream_opened:
+                        self._publish_stream_delta(stream_id, raw_text, False)
+                    self._publish_stream_end(stream_id, raw_text)
+                continue
             if collaborative and not pending_calls and not error_seen:
                 decision, reason, _, _, metrics = self._termination_snapshot()
                 if metrics.budget_used_ratio >= 1:
@@ -6639,7 +6908,10 @@ class MasterAgent:
                 ]
                 self.messages.append(assistant_message)
 
-                await self._run_chat_tools(pending_calls)
+                try:
+                    await self._message_signal.run(self._run_chat_tools(pending_calls))
+                except MessageInterrupt:
+                    pass
                 continue
 
             final = text_reply or "(LLM 没有返回内容)"
@@ -6719,10 +6991,33 @@ class MasterAgent:
         )
 
     async def _ask_continue_iteration(self, steps_so_far: int) -> bool:
-        return await self._await_approval(
+        # Mail can update the paused context, but cannot authorize more work.
+        approval = asyncio.create_task(self._await_approval(
             kind="iteration", operation=f"已执行 {steps_so_far} 步工具调用，是否继续推理？",
             target="(iteration soft-limit)", risk_level="L1",
-        )
+        ))
+        try:
+            while True:
+                notifications = self._pack_notifications("master")
+                self._message_signal.acknowledge()
+                if notifications:
+                    self.messages.append({"role": "user", "content": notifications})
+                    self.publish_action("已收到 Agent 定向消息；继续推理仍需当前审批。")
+                try:
+                    return await self._message_signal.run(asyncio.shield(approval))
+                except MessageInterrupt:
+                    continue
+        finally:
+            cancel_task(approval)
+            drain = asyncio.gather(approval, return_exceptions=True)
+            cancelled = False
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _await_approval(
         self, *, kind: str, operation: str, target: str, risk_level: str,

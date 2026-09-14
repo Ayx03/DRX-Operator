@@ -27,6 +27,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 MAX_MESSAGES = 1000
 EXCERPT_CHARS = 400
@@ -91,6 +92,7 @@ class IRC:
         self.excerpt_chars: int = int(excerpt_chars or EXCERPT_CHARS)
         self._messages: dict[int, IRCMessage] = {}
         self._next_id: int = 1
+        self.on_message: Callable[[IRCMessage], None] | None = None
 
     # ------------------------------------------------------------- internals
 
@@ -119,6 +121,7 @@ class IRC:
         content,
         *,
         reply_to=0,
+        terminal=False,
         now=None,
     ) -> int | None:
         """Append a directed message; return its id, or ``None`` when rejected.
@@ -153,12 +156,14 @@ class IRC:
             to_agent=to_agent,
             content=content,
             reply_to=reply_to,
-            status=IRCStatus.ANSWERED.value if reply_to != 0 else IRCStatus.OPEN.value,
+            status=IRCStatus.ANSWERED.value if reply_to != 0 or terminal else IRCStatus.OPEN.value,
             created_at=now,
         )
         if target is not None:
             target.status = IRCStatus.ANSWERED.value
         self._prune()
+        if self.on_message is not None:
+            self.on_message(self._messages[mid])
         return mid
 
     # ----------------------------------------------------------------- read

@@ -445,7 +445,7 @@ class DrxAgent:
                 moderator = Moderator.from_dict(restored["moderator"])
                 irc = IRC.from_dict(restored["irc"])
                 project_note = ProjectNote.from_dict(restored["project_note"])
-                ballot, members, run_id = self.master._decode_team_state(
+                ballot, members, run_id, residents = self.master._decode_team_state(
                     restored["team"], stage=stage.stage.value,
                 )
                 candidate = TranscriptLog(EventBus())
@@ -480,6 +480,7 @@ class DrxAgent:
                     self.master.ballot = ballot
                     self.master._team_members = members
                     self.master._run_id = run_id
+                    self.master._resident_workers = residents
                 finally:
                     self.master.finish_restore()
 

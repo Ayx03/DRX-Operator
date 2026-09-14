@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import aclosing
+from copy import deepcopy
 import json
 import logging
 import re
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
+from drx_agent.agent.steering import MessageInterrupt, MessageSignal
 from drx_agent.event_bus import Activity, Event, EventBus, EventType, activity_model_stream
 
 logger = logging.getLogger(__name__)
@@ -107,6 +109,9 @@ class SubAgent:
         self.stop_on_pattern = stop_on_pattern
         self.status = SubAgentStatus.QUEUED
         self._interrupt = False
+        self.messages: list[dict] = []
+        self.message_signal = MessageSignal()
+        self.activation = 0
         self.started_at: float | None = None
         self.last_activity_at: float | None = None
         self._activity: Activity | None = None
@@ -139,11 +144,148 @@ class SubAgent:
         if self._activity is not None:
             self._activity.update("stopping")
 
+    def request_message(self) -> None:
+        """Wake an active phase without changing explicit stop state."""
+        self.message_signal.notify()
+
+    @staticmethod
+    def _cancelled_call(call: dict) -> dict:
+        return {
+            "role": "tool", "tool_call_id": call["id"],
+            "name": call["function"]["name"],
+            "content": json.dumps({"error": "Tool interrupted", "status": "cancelled"}),
+        }
+
+    @staticmethod
+    def _validate_messages(messages: Any, *, allow_pending: bool = False) -> dict:
+        if not isinstance(messages, list):
+            raise ValueError("resident messages must be a list")
+        pending: dict[str, dict] = {}
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise ValueError("resident message must be an object")
+            role = message.get("role")
+            if not isinstance(role, str) or role not in {"system", "user", "assistant", "tool"}:
+                raise ValueError("invalid resident message role")
+            if (index == 0) != (role == "system"):
+                raise ValueError("resident history must have one leading system prompt")
+            content = message.get("content")
+            if "content" not in message:
+                raise ValueError("resident message content is missing")
+            if not isinstance(content, (str, list)) and not (role == "assistant" and content is None):
+                raise ValueError("invalid resident message content")
+            if isinstance(content, list) and any(not isinstance(part, dict) for part in content):
+                raise ValueError("invalid resident content blocks")
+            if role == "system" and not isinstance(content, str):
+                raise ValueError("invalid resident system prompt")
+            if pending and role != "tool":
+                raise ValueError("resident tool calls are not paired")
+            if role == "tool":
+                call_id = message.get("tool_call_id")
+                if not isinstance(call_id, str) or call_id not in pending:
+                    raise ValueError("unexpected resident tool result")
+                call = pending.pop(call_id)
+                if "name" in message and message["name"] != call["function"]["name"]:
+                    raise ValueError("resident tool result name does not match")
+            elif "tool_call_id" in message:
+                raise ValueError("tool result identity on non-tool message")
+            if "tool_calls" in message:
+                calls = message["tool_calls"]
+                if role != "assistant" or not isinstance(calls, list):
+                    raise ValueError("invalid resident tool calls")
+                for call in calls:
+                    if not isinstance(call, dict):
+                        raise ValueError("invalid resident tool call")
+                    call_id, function = call.get("id"), call.get("function")
+                    if not isinstance(call_id, str) or not call_id or call_id in pending:
+                        raise ValueError("invalid or duplicate resident tool call identity")
+                    if call.get("type") != "function" or not isinstance(function, dict):
+                        raise ValueError("invalid resident tool function")
+                    if not isinstance(function.get("name"), str) or not function["name"]:
+                        raise ValueError("invalid resident tool name")
+                    arguments = function.get("arguments")
+                    if not isinstance(arguments, str):
+                        raise ValueError("invalid resident tool arguments")
+                    try:
+                        parsed = json.loads(arguments)
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError("invalid resident tool arguments") from exc
+                    if not isinstance(parsed, dict):
+                        raise ValueError("resident tool arguments must be an object")
+                    pending[call_id] = call
+        if pending and not allow_pending:
+            raise ValueError("resident tool calls are not paired")
+        return pending
+
+    @staticmethod
+    def validate_runtime(data: Any) -> dict:
+        """Validate persisted private context, returning a detached JSON value."""
+        if not isinstance(data, dict):
+            raise ValueError("resident runtime must be an object")
+        if type(data.get("activation")) is not int or data["activation"] < 0:
+            raise ValueError("invalid resident activation")
+        if type(data.get("stopped")) is not bool:
+            raise ValueError("invalid resident stopped flag")
+        try:
+            detached = json.loads(json.dumps(data, allow_nan=False))
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise ValueError("resident runtime must contain JSON values") from exc
+        SubAgent._validate_messages(detached.get("messages"))
+        messages = detached["messages"]
+        if detached["activation"] and (len(messages) < 2 or messages[1]["role"] != "user"):
+            raise ValueError("activated resident history must retain its initial context")
+        return {
+            "messages": detached["messages"], "activation": detached["activation"],
+            "stopped": detached["stopped"],
+        }
+
+    def snapshot_runtime(self) -> dict:
+        """Pair active calls in the snapshot only; restored calls never replay."""
+        messages = deepcopy(self.messages)
+        pending = self._validate_messages(messages, allow_pending=True)
+        messages.extend(self._cancelled_call(call) for call in pending.values())
+        return self.validate_runtime({
+            "messages": messages, "activation": self.activation, "stopped": self._interrupt,
+        })
+
+    def _take_notification(self) -> tuple[bool, str]:
+        pending = self.message_signal.pending
+        self.message_signal.acknowledge()
+        note = ""
+        if self.notification_provider is not None:
+            try:
+                note = self.notification_provider() or ""
+            except Exception:
+                logger.exception("Sub-agent %s notification_provider failed", self.agent_id)
+        return pending or bool(note) or self.message_signal.pending, note
+
+    def _append_notification(self, note: str) -> None:
+        if note:
+            self.messages.append({"role": "user", "content": "<新论坛通知>\n" + note})
+
+    def _retain_assistant(self, supplied: dict | None, text: str) -> None:
+        message = deepcopy(supplied) if supplied is not None else {
+            "role": "assistant", "content": text,
+        }
+        message.pop("tool_calls", None)
+        if text:
+            message["content"] = text
+        if supplied is not None or text:
+            self.messages.append(message)
+
     def _mark_cancelled(self, error_seen: str) -> str:
         self.status = SubAgentStatus.CANCELLED
         return error_seen or "interrupted"
 
     async def run(self) -> SubAgentResult:
+        if self.status is SubAgentStatus.RUNNING:
+            raise RuntimeError("sub-agent activation is already running")
+        self.activation += 1
+        if not self.messages:
+            self.messages.extend([
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": self.task},
+            ])
         self.status = SubAgentStatus.RUNNING
         started = asyncio.get_running_loop().time()
         self.started_at = self.last_activity_at = time.time()
@@ -161,6 +303,8 @@ class SubAgent:
                 result.error = self._mark_cancelled(result.error)
             # No-LLM fallback (used by /scan, /exploit and unit tests).
             elif self.llm_provider is None or self.tool_executor is None:
+                _, note = self._take_notification()
+                self._append_notification(note)
                 self.status = SubAgentStatus.DONE
                 result.scripts_executed = 1
             else:
@@ -173,6 +317,7 @@ class SubAgent:
             self.status = SubAgentStatus.TIMEOUT
             result.error = f"ttl ({self.ttl}s) exceeded"
         except asyncio.CancelledError:
+            self._interrupt = True
             result.error = self._mark_cancelled(result.error)
         except Exception as exc:
             self.status = SubAgentStatus.ERROR
@@ -191,31 +336,22 @@ class SubAgent:
         return result
 
     async def _react_loop(self, result: SubAgentResult) -> None:
-        messages: list[dict] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": self.task},
-        ]
+        messages = self.messages
 
         for _iteration in range(self.max_iterations):
             if self._interrupt:
                 result.error = self._mark_cancelled(result.error)
                 break
 
-            if self.notification_provider is not None:
-                try:
-                    note = self.notification_provider() or ""
-                except Exception:
-                    logger.exception("Sub-agent %s notification_provider failed", self.agent_id)
-                    note = ""
-                if note:
-                    messages.append(
-                        {"role": "user", "content": "<新论坛通知>\n" + note}
-                    )
+            _, note = self._take_notification()
+            self._append_notification(note)
 
             text_parts: list[str] = []
             pending_calls: list[dict] = []
             assistant_msg: Optional[dict] = None
             saw_error = False
+            model_finished = False
+            interrupted = False
 
             try:
                 async def _consume():
@@ -255,7 +391,10 @@ class SubAgent:
                                     result.error = ev.content or "unknown LLM error"
                                     saw_error = True
                                 break
-                await _wait_owned(_consume(), self.llm_call_timeout)
+                await self.message_signal.run(_consume(), timeout=self.llm_call_timeout)
+                model_finished = True
+            except MessageInterrupt:
+                interrupted = True
             except asyncio.TimeoutError:
                 logger.error(
                     "Sub-agent %s LLM call timed out after %ss",
@@ -268,20 +407,37 @@ class SubAgent:
                 result.error = str(exc)
                 saw_error = True
             finally:
-                text_now = "".join(text_parts).strip()
+                text_now = "".join(text_parts)
                 if text_now:
                     result.text = text_now
+                if not model_finished:
+                    self._retain_assistant(assistant_msg, text_now)
 
-            if self.status is SubAgentStatus.CANCELLED:
-                break
-            if saw_error:
-                self.status = SubAgentStatus.ERROR
-                break
-
-            if not pending_calls:
-                break
             if self._interrupt:
                 result.error = self._mark_cancelled(result.error)
+            if self.status is SubAgentStatus.CANCELLED:
+                if model_finished:
+                    self._retain_assistant(assistant_msg, text_now)
+                break
+            if saw_error:
+                if model_finished:
+                    self._retain_assistant(assistant_msg, text_now)
+                self.status = SubAgentStatus.ERROR
+                break
+            if interrupted:
+                continue
+
+            # Leave late mail unread if this activation cannot process another turn.
+            incoming, note = (
+                self._take_notification() if _iteration + 1 < self.max_iterations
+                else (self.message_signal.pending, "")
+            )
+            if incoming:
+                self._retain_assistant(assistant_msg, text_now)
+                self._append_notification(note)
+                continue
+            if not pending_calls:
+                self._retain_assistant(assistant_msg, text_now)
                 break
 
             for call in pending_calls:
@@ -302,7 +458,20 @@ class SubAgent:
             ]
             messages.append(assistant_msg)
             tool_start = len(messages)
-            await self._run_tool_calls(pending_calls, messages, result)
+            try:
+                await self.message_signal.run(self._run_tool_calls(pending_calls, messages, result))
+            except MessageInterrupt:
+                continue
+            if self._interrupt:
+                result.error = self._mark_cancelled(result.error)
+                break
+            incoming, note = (
+                self._take_notification() if _iteration + 1 < self.max_iterations
+                else (self.message_signal.pending, "")
+            )
+            if incoming:
+                self._append_notification(note)
+                continue
 
             if self.stop_on_pattern is not None:
                 tool_texts = [
@@ -324,9 +493,11 @@ class SubAgent:
         executor = self.tool_executor
         if executor is None:
             return
-        outputs: list[str | None] = [None] * len(pending_calls)
+        completed: set[str] = set()
 
-        async def execute(index: int, call: dict):
+        async def execute(call: dict):
+            if self._interrupt or self.message_signal.pending:
+                return
             try:
                 try:
                     output = await executor(call["name"], call["input"])
@@ -334,7 +505,11 @@ class SubAgent:
                     output = json.dumps(
                         {"error": f"tool raised: {exc}"}, ensure_ascii=False
                     )
-                outputs[index] = output
+                completed.add(call["id"])
+                messages.append({
+                    "role": "tool", "tool_call_id": call["id"],
+                    "name": call["name"], "content": output,
+                })
                 result.scripts_executed += 1
             finally:
                 self.last_activity_at = time.time()
@@ -342,26 +517,23 @@ class SubAgent:
         try:
             if self.parallel_tool_calls and len(pending_calls) > 1:
                 await asyncio.gather(
-                    *(execute(index, call) for index, call in enumerate(pending_calls)),
+                    *(execute(call) for call in pending_calls),
                     return_exceptions=True,
                 )
             else:
-                for index, call in enumerate(pending_calls):
+                for call in pending_calls:
                     if self._interrupt:
                         result.error = self._mark_cancelled(result.error)
                         break
-                    await execute(index, call)
+                    if self.message_signal.pending:
+                        break
+                    await execute(call)
         finally:
-            # The owning execution task is cancelled only once and joined by run().
-            # All children have cleaned up here; retain successful sibling output
-            # and pair even unstarted calls before exposing the terminal result.
-            for call, output in zip(pending_calls, outputs):
-                if output is None:
-                    output = json.dumps({"error": "Tool interrupted", "status": "cancelled"})
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "name": call["name"],
-                    "content": output,
-                })
+            # The phase owner joins every child before this pairing is exposed.
+            # Finished outputs are already in history, including active snapshots.
+            for call in pending_calls:
+                if call["id"] not in completed:
+                    messages.append(self._cancelled_call({
+                        "id": call["id"], "function": {"name": call["name"]},
+                    }))
 
