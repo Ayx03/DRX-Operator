@@ -5,9 +5,9 @@ Design principles (EXOBoost research report):
   PROGRAM decides. ``can_close`` is a pure deterministic gate over a
   ``TerminationState``; no LLM, no I/O.
 - Termination is NOT 100% unanimity. It is:
-  ``Stop = BudgetExceeded ∨ (Coverage ≥ θc ∧ CriticalOpenIssues = 0 ∧
-  VerifierQueue = 0 ∧ Quorum ≥ θq)`` — encoded as an ordered gate where any
-  hard reject short-circuits before the quorum check.
+  ``Stop = WorkersDrained ∧ (BudgetExceeded ∨ (WorkAndMessagesDrained ∧
+  Coverage ≥ θc ∧ CriticalOpenIssues = 0 ∧ VerifierQueue = 0 ∧ Quorum ≥ θq))``.
+  Budget exhaustion permits an incomplete report, never a completion claim.
 - Coverage is risk-weighted: critical coverage is a hard threshold, while the
   weighted coverage carries the soft threshold.
 
@@ -37,6 +37,9 @@ class TerminationState:
     open_critical_issues: int = 0
     quorum: float = 0.0
     conflicts: int = 0
+    open_work: int = 0
+    active_workers: int = 0
+    pending_messages: int = 0
 
 
 @dataclass
@@ -56,6 +59,45 @@ _DECISION_LABEL = {
 }
 
 
+def verification_outcome(finding) -> tuple[str, bool]:
+    """Return the effective verdict and whether verification needs adjudication.
+
+    Structured verification takes precedence over a stale finding status.
+    Legacy manual confirmations require evidence; a status label alone is not
+    verification. A terminal adjudication resolves earlier verifier disagreement.
+    """
+    verification = getattr(finding, "verification", None) or {}
+    if verification:
+        adjudicated = verification.get("adjudicated")
+        effective = adjudicated if isinstance(adjudicated, dict) else verification
+        verdict = str(effective.get("verdict") or "")
+        if isinstance(adjudicated, dict) and verdict in ("confirmed", "rejected"):
+            return verdict, False
+        a = verification.get("verifier_a") or {}
+        b = verification.get("verifier_b") or {}
+        a_verdict, b_verdict = a.get("verdict"), b.get("verdict")
+        disagreement = bool(a_verdict and b_verdict and a_verdict != b_verdict)
+        if disagreement:
+            return "uncertain", True
+        if not verdict and a_verdict and a_verdict == b_verdict:
+            verdict = str(a_verdict)
+        verdict = verdict or "uncertain"
+        return verdict, verdict == "uncertain"
+    status = str(getattr(finding, "status", "") or "")
+    if status == "retracted":
+        return "rejected", False
+    if status in ("confirmed", "exploited"):
+        evidence = getattr(finding, "evidence", None) or []
+        if any(
+            getattr(e, "value", "") or getattr(e, "cve", "")
+            or getattr(e, "payload", "") or getattr(e, "result", "")
+            or getattr(e, "evidence_id", "")
+            for e in evidence
+        ):
+            return "confirmed", False
+    return "pending", False
+
+
 class TerminationController:
     """Pure decision gate over ``TerminationState``."""
 
@@ -65,13 +107,19 @@ class TerminationController:
     def can_close(self, state: TerminationState) -> tuple[Decision, str]:
         """The report's stop gate, in priority order.
 
-        Budget exhaustion forces an APPROVE (progress preserved, not success).
-        Each hard blocker rejects before quorum; quorum shortfall is PENDING
-        (recoverable — not a hard reject).
+        Live workers must drain before any stop. Budget exhaustion then allows
+        an incomplete stop with remaining work/messages preserved. Otherwise all
+        hard blockers reject before quorum; quorum shortfall is PENDING.
         """
         p = self.policy
+        if state.active_workers > 0:
+            return Decision.REJECT, f"仍有 {state.active_workers} 个运行中的 worker，不可收束"
         if state.budget_exceeded:
             return Decision.APPROVE, "预算耗尽，强制停止（保留进度，不是完成）"
+        if state.open_work > 0:
+            return Decision.REJECT, f"仍有 {state.open_work} 项未完成任务，不可收束"
+        if state.pending_messages > 0:
+            return Decision.REJECT, f"仍有 {state.pending_messages} 条未交付或待处理消息，不可收束"
         if state.open_critical_issues > 0:
             return (
                 Decision.REJECT,
@@ -114,25 +162,28 @@ class TerminationController:
         conflicts: int = 0,
         budget_used_ratio: float = 0.0,
         budget_exceeded: bool = False,
+        open_work: int = 0,
+        active_workers: int = 0,
+        pending_messages: int = 0,
     ) -> TerminationState:
         """Build a ``TerminationState`` from a coverage dict + raw signals.
 
         Coverage dict: ``{"critical_modules": {"covered": n, "total": m}, ...}``.
-        ``critical_coverage = covered/total`` for the critical bucket (1.0 when
-        ``total == 0``). ``weighted_coverage`` comes from an optional ``weighted``
-        key (a bucket dict or a scalar) and otherwise equals ``critical_coverage``.
+        ``critical_coverage = covered/total`` for the critical bucket; absent or
+        zero-total coverage is unknown (0.0), never evidence of completion.
+        ``weighted`` may be a bucket or scalar; absent weights use the critical ratio.
         """
         coverage = coverage or {}
         crit_bucket = coverage.get("critical_modules") or coverage.get("critical") or {}
         crit_covered = int((crit_bucket.get("covered", 0) or 0)) if isinstance(crit_bucket, dict) else 0
         crit_total = int((crit_bucket.get("total", 0) or 0)) if isinstance(crit_bucket, dict) else 0
-        critical_coverage = (crit_covered / crit_total) if crit_total > 0 else 1.0
+        critical_coverage = (crit_covered / crit_total) if crit_total > 0 else 0.0
 
         weighted = coverage.get("weighted")
         if isinstance(weighted, dict):
-            w_covered = int(weighted.get("covered", 0) or 0)
-            w_total = int(weighted.get("total", 0) or 0)
-            weighted_coverage = (w_covered / w_total) if w_total > 0 else 1.0
+            w_covered = float(weighted.get("covered", 0) or 0)
+            w_total = float(weighted.get("total", 0) or 0)
+            weighted_coverage = (w_covered / w_total) if w_total > 0 else 0.0
         elif isinstance(weighted, (int, float)) and not isinstance(weighted, bool):
             weighted_coverage = float(weighted)
         else:
@@ -146,6 +197,9 @@ class TerminationController:
             open_critical_issues=int(open_critical_issues or 0),
             quorum=float(quorum or 0.0),
             conflicts=int(conflicts or 0),
+            open_work=int(open_work or 0),
+            active_workers=int(active_workers or 0),
+            pending_messages=int(pending_messages or 0),
         )
 
     def render(self, decision: Decision, reason: str) -> str:

@@ -39,19 +39,29 @@ class SessionManager:
 
     def restore(self, session_id: str) -> dict | None:
         data = self.store.load_session(session_id)
-        if not data:
+        if data is None:
             return None
         kb = KnowledgeBase.from_dict(data["kb_data"])
-        meta = data.get("metadata", {}) or {}
-        extra = meta.get("extra", {}) or {}
+        meta = data["metadata"]
+        extra = meta.get("extra", {})
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cache_hit_tokens": 0,
+            "cost_usd": 0.0,
+            "requests": 0,
+            "by_model": {},
+            **extra.get("session_usage", {}),
+        }
         return {
             "kb": kb,
-            "messages": data.get("messages", []),
+            "messages": data["messages"],
             "active_targets": meta.get("active_targets", []),
             "phase": data.get("phase", ""),
             "todos": extra.get("todos", []),
-            "mode": extra.get("mode", "act"),
-            "session_usage": extra.get("session_usage", {}),
+            "mode": extra.get("mode", "act") or "act",
+            "session_usage": usage,
             "frontier": extra.get("frontier", {}),
             "handoff": extra.get("handoff", {}),
             "stage": extra.get("stage", {}),

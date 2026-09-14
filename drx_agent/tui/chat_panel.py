@@ -566,7 +566,14 @@ class ChatPanel(VerticalScroll):
             "L0": "#3fb950", "L1": "#3fb950",
             "L2": "#f0883e", "L3": "#f85149", "L4": "#f85149",
         }.get(risk, "#f0883e")
-        text = f"[{risk}] Confirm: {op}\n  [y]approve [n]deny [v]view details"
+        request_id = str(d.get("request_id", ""))[:8]
+        agent_id = d.get("agent_id", "master")
+        target = d.get("target") or "(local)"
+        if d.get("requires_confirmation_phrase"):
+            choices = "输入 I CONFIRM DESTRUCTIVE ACTION 批准；[n]拒绝 [v]详情"
+        else:
+            choices = "[y]批准 [n]拒绝 [v]详情"
+        text = f"[{risk}] 审批 {request_id} · {agent_id}\n  {op} → {target}\n  {choices}"
         self._append(MessageBubble(marker="⚠", marker_style=color, text=text))
 
     def _on_error(self, event: Event) -> None:

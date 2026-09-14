@@ -85,17 +85,21 @@ class PermissionEngine:
     def check(self, tool_name: str, args: dict) -> PermissionDecision:
         args_repr = self._args_repr(args)
 
-        if tool_name in self._session_tool_grants:
-            return PermissionDecision(action="allow", args_repr=args_repr)
-        if self._session_grants.get((tool_name, args_repr)):
-            return PermissionDecision(action="allow", args_repr=args_repr)
-
+        decision = PermissionDecision(action="allow", args_repr=args_repr)
         for rule in self.rules:
             if rule.matches(tool_name, args_repr):
-                return PermissionDecision(
+                decision = PermissionDecision(
                     action=rule.action, rule=rule, args_repr=args_repr
                 )
-        return PermissionDecision(action="allow", args_repr=args_repr)
+                break
+        if decision.action == "deny":
+            return decision
+        if (
+            tool_name in self._session_tool_grants
+            or self._session_grants.get((tool_name, args_repr))
+        ):
+            return PermissionDecision(action="allow", args_repr=args_repr)
+        return decision
 
     def grant_session(self, tool_name: str, args_repr: str = "") -> None:
         """Remember this approval for the rest of the session."""
@@ -103,6 +107,11 @@ class PermissionEngine:
             self._session_grants[(tool_name, args_repr)] = True
         else:
             self._session_tool_grants.add(tool_name)
+
+    def reset_session(self) -> None:
+        """Forget interactive grants without changing declarative policy."""
+        self._session_grants.clear()
+        self._session_tool_grants.clear()
 
     def add_rule(self, rule: PermissionRule, prepend: bool = True) -> None:
         if prepend:

@@ -48,7 +48,7 @@ DRX-Operator includes built-in Python/Bash sandboxes, persistent shell session m
 
 **Priority-Based Task Scheduling and Parallel Dispatch** — A five-level priority queue: Exploit > Recon > Lateral > Persist > Report. Supports per-target concurrency limits and global QPS controls. Each SubAgent maintains its own message history and ReAct loop, allowing multiple subtasks to run concurrently.
 
-**Session Persistence** — SQLite metadata combined with JSON file storage enables complete session save/restore, including the knowledge base, message history, todo list, operating mode, and token usage statistics.
+**Session Persistence** — Atomic SQLite snapshots save the knowledge base, message history, collaboration state, stage, todo list, and usage statistics together. Restore drains old execution before replacing state and requeues orphaned work without refunding consumed steps. Existing JSON-sidecar sessions remain readable.
 
 **LLM Resilience Layer** — Exponential-backoff retries plus Provider fallback chains. HTTP 429, 5xx, and connection-related errors are retried automatically. If retries are exhausted, the system automatically switches to the next Provider, while the UI displays the failover status in real time.
 
@@ -246,13 +246,16 @@ Use `/plan` and `/act` to switch between modes.
 
 Sessions are automatically saved under the `sessions/` directory.
 
-Stored data includes:
+Use `/save` to save and `/resume` to restore the most recent session.
 
-* Knowledge base (targets, findings, credentials) → `sessions/<id>/kb.json`
-* Message history → `sessions/<id>/messages.json`
-* Metadata (todo list, mode, usage statistics) → `sessions/sessions.db` (SQLite)
+New sessions store their complete, versioned snapshot in `sessions/sessions.db` in one transaction:
 
-Enter `"restore session"` in the chat to restore the most recently saved session.
+* Knowledge base, message history, targets, todos, mode, and usage statistics
+* Frontier, stage, handoff, Forum subscriptions/messages, IRC messages, and claims
+
+Restore waits for old chat, queued dispatch, workers, and approvals to finish cancellation before replacing any state. Orphaned `claimed` intents become `open`, consumed steps are retained, callbacks are rebound, and session-only authorizations are cleared. Pending communication is preserved rather than silently marked complete.
+
+Legacy sessions with SQLite metadata plus `sessions/<id>/messages.json` and `kb.json` can still be read. Saving again writes the new snapshot format; it does not overwrite legacy files. Corrupt or incomplete snapshots fail explicitly instead of restoring an empty session.
 
 ### Project Memory
 
@@ -321,11 +324,20 @@ When a task can be decomposed into independent subtasks, the Master Agent dispat
 Each SubAgent:
 
 1. Has its own unique `agent_id` (for example, `recon-a1b2c3`) and independent message history
-2. Shares the parent Agent's `tool_executor` and therefore uses the same sandbox, shell sessions, and knowledge base
+2. Uses a runtime-bound identity with the parent's tool executor; model-supplied `author`, `owner`, or `agent_id` cannot impersonate another Agent
 3. Runs its own ReAct loop with a maximum iteration count and TTL limit
 4. Publishes a `SUB_AGENT_RESULT` event through the EventBus when finished, allowing the sidebar to update in real time
 
 SubAgents cannot recursively invoke the `task` tool, preventing uncontrolled recursive Agent spawning.
+
+### Agent Communication and Completion
+
+* **Forum:** typed threads, bounded notification excerpts, and subscriptions via `forum_subscribe(topic)`. Ordinary public posts go only to subscribers; directed posts and announcements retain their separate delivery rules. `forum_read` retrieves the original thread. Retention evicts whole threads, never orphaned replies; pinned and unresolved question/help threads are protected, and a full protected forum rejects new posts explicitly.
+* **Responsibilities:** `forum_pending` reports unresolved question/help roots with their original IDs, owner (`to`, or `master` for public questions), and overdue status. A positive `ttl` sets the response deadline; expiry escalates visibility to the coordinator without deleting the obligation.
+* **IRC:** `irc_inbox(after_id, limit)` reads full messages, including terminal answers, in oldest-first pages. Notifications use separate Forum/IRC budgets and advance only through delivered excerpts, so a busy forum cannot discard replies. `irc_reply` and `irc_close` enforce the actual participant identity. Workers cannot inspect third-party IRC bodies through `team_status`.
+* **Orphaned IRC:** only the Master can use `irc_admin_close(message_id, reason)` when both participants are offline. The reason, original participants, and original message remain in the audit history; administrative closure is not a fabricated reply.
+* **Work ownership:** all worker dispatch paths use the same lifecycle and lease handling. Duplicate dispatch is refused; active leases are renewed and released on exit. `claim_acquire`/`claim_release` enforce worker ownership, and `team_status` reports real workers rather than forum posting history.
+* **Truth and completion:** verifier decisions update finding status and invalidate retracted dependencies. Finishing an intent does not promote its original hypothesis to fact. Stage changes refresh the next model request's tools and instructions. `request_close` checks work, coverage, validation, and unresolved or undelivered messages; a completed zero-finding investigation is valid. Budget exhaustion stops/drains execution and returns `budget_exhausted`, not `completed`.
 
 ### Security Model
 
@@ -336,10 +348,10 @@ DRX-Operator implements a two-layer security model.
 | Level | Description                           | Behavior                                   |
 | ----- | ------------------------------------- | ------------------------------------------ |
 | L0    | Reconnaissance                        | Automatically approved                     |
-| L1    | Passive vulnerability scanning        | Approved once, then cached for the session |
-| L2    | Active vulnerability exploitation     | Requires user approval for every operation |
-| L3    | Credential / persistence attacks      | Requires user approval for every operation |
-| L4    | Destructive / irreversible operations | Requires a confirmation phrase             |
+| L1    | Passive vulnerability scanning        | Automatically approved; cannot authorize a higher risk |
+| L2    | Active vulnerability exploitation     | Approval scoped to the same operation, risk, and target |
+| L3    | Credential / persistence attacks      | Separate approval scoped to the same operation, risk, and target |
+| L4    | Destructive / irreversible operations | Fresh exact confirmation required every time |
 
 **PermissionEngine** — declarative tool rules:
 
@@ -362,7 +374,7 @@ Supported decisions:
 
 The first matching rule takes effect.
 
-Users may respond with `always` to promote an approval rule to a session-wide permanent allowance.
+Users may respond with `always` to extend a permission approval for the session, but this never overrides a matching `deny` rule. All permission, safety, and continuation prompts share one serialized approval queue. The TUI shows the request ID, Agent, operation, and target; responses must match that request ID. L4 requires the exact phrase `I CONFIRM DESTRUCTIVE ACTION`; `y` is insufficient, and approvals from lower risk levels are never reused.
 
 ### LLM Resilience Design
 
@@ -445,6 +457,12 @@ Users may respond with `always` to promote an approval rule to a session-wide pe
 | `task`               | Dispatch an independent SubAgent to execute a self-contained subtask with its own message history and ReAct loop                        |
 | `dispatch_sub_agent` | Dispatch a specialized red-team SubAgent (`recon`/`exploit`/`lateral`/`persist`/`report`)                                               |
 | `generate_report`    | Generate a Markdown/HTML penetration testing report from session findings. Optionally includes token/cost statistics                    |
+| `forum_post` / `forum_read` | Publish a typed thread/reply or read original messages |
+| `forum_subscribe` / `forum_pending` | Subscribe to a topic or inspect assigned unresolved questions and deadlines |
+| `irc_send` / `irc_inbox` / `irc_reply` | Send, page through, and answer directed messages under the runtime Agent identity |
+| `irc_close` / `irc_admin_close` | Participant closure; Master-only audited closure of an offline pair's orphaned obligation |
+| `claim_acquire` / `claim_release` / `claim_status` | Manage owned work leases without impersonating another worker |
+| `team_status` / `request_close` | Inspect actual collaboration state or request program-level completion/budget-stop adjudication |
 
 ### Context Management
 

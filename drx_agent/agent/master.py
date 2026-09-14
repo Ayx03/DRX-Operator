@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Optional
 
@@ -255,6 +256,7 @@ class MasterAgent:
         # ReAct loop runs by default via the EventBus; start()/stop() only pause externally.
         self.running = True
         self.active_sub_agents: dict[str, SubAgent] = {}
+        self._worker_runners: set[asyncio.Task] = set()
         self.active_sub_agent_tasks: dict[str, asyncio.Task] = {}
         self.frontier: Frontier = Frontier()
         self.handoff: Handoff | None = None
@@ -265,7 +267,14 @@ class MasterAgent:
         self.termination: TerminationController = TerminationController()
         self.irc: IRC = IRC()
         self.project_note: ProjectNote = ProjectNote()
-        self._forum_cursor: int = 0
+        self._notification_cursors: dict[str, dict[str, int]] = {}
+        self._actor: ContextVar[str] = ContextVar("master_tool_actor", default="master")
+        self._worker_claims: dict[str, dict[str, float]] = {}
+        self._lease_interval = 1.0
+        self._restore_lock = asyncio.Lock()
+        self._restoring = False
+        self._session_generation = 0
+        self._chat_task: asyncio.Task | None = None
         self._last_moderator_render: str = ""
         self._intent_agent_map: dict[str, str] = {}
         self.frontier.on_invalidate = self._on_frontier_invalidate
@@ -278,13 +287,11 @@ class MasterAgent:
         # 此值须高于重试链最坏时长，防真正的静默挂起）。
         self.llm_call_timeout: float = 600.0
         self.swarm_mode: bool = False
-        self._sub_exec_depth: int = 0
         self._script_counter = 0
         self._retry_counts: dict[str, int] = {}
         # After this many tool calls in one turn, ask the user to continue
         # (0 disables); a parked Future resumes the awaiting coroutine.
         self.iteration_soft_threshold = 100
-        self._iter_continue_future: Optional[asyncio.Future] = None
         self.todos: list[dict] = []
         # Context management — a layered filter/prune pipeline (NOT memory).
         # Trigger is the MODEL's real context window, not a fixed number.
@@ -343,11 +350,9 @@ class MasterAgent:
         self._recent_request_ts: list[float] = []
         # Permission engine (allow/ask/deny per tool) — independent of the L0-L4 SafetyGate.
         self.permissions = PermissionEngine()
-        self._tool_approval_future: Optional[asyncio.Future] = None
-        self._tool_approval_args: Optional[tuple[str, str]] = None
-        self._safety_approval_future: Optional[asyncio.Future] = None
-        self._safety_approval_request_id: Optional[str] = None
-        self._safety_approval_requires_phrase: bool = False
+        self._approval_future: asyncio.Future | None = None
+        self._approval_request: dict | None = None
+        self._approval_lock = asyncio.Lock()
         # Operating mode: 'act' (default) or 'plan' (readonly tools); switch via /plan /act.
         self.mode: str = "act"
         # A new directive or /stop sets _interrupt; the loop checks it at the top of each iteration and bails out cleanly.
@@ -356,8 +361,6 @@ class MasterAgent:
         # Serializes the ReAct loop: a steering message waits for the current
         # loop to release the lock, so tool_call/tool pairs can't interleave.
         self._chat_lock: Optional[asyncio.Lock] = None
-        self._safety_approval_lock: asyncio.Lock = asyncio.Lock()
-        self._tool_approval_lock: asyncio.Lock = asyncio.Lock()
         # Project memory from DRX.md / AGENTS.md, appended to the system prompt every turn.
         self.project_memory: str = self._load_project_memory()
         self.project_memory_path: Optional[Path] = self._project_memory_path()
@@ -418,35 +421,15 @@ class MasterAgent:
 
 
     async def _handle_user_message(self, event: Event) -> None:
+        if self._restoring:
+            return
         
         text = event.data.get("text", "").strip()
         image_path = event.data.get("image_path")
 
-        if (
-            self._safety_approval_future is not None
-            and not self._safety_approval_future.done()
-            and self._safety_approval_requires_phrase
-            and text
-            and not text.startswith("/")
-        ):
-            req_id = self._safety_approval_request_id
-            if text == DESTROY_CONFIRMATION_PHRASE:
-                if req_id:
-                    self.safety_gate.approve(req_id)
-                self._safety_approval_future.set_result(True)
-                self.publish_action("破坏性操作已确认。")
-            else:
-                if req_id:
-                    self.safety_gate.deny(req_id)
-                self._safety_approval_future.set_result(False)
-                self.publish_action(
-                    f"确认短语不匹配，操作已拒绝。请重新发起操作并输入精确短语："
-                    f"「{DESTROY_CONFIRMATION_PHRASE}」"
-                )
-            return
 
         if text in ("/stop", "/cancel", "/interrupt"):
-            if self._chat_active:
+            if self._chat_active or self.active_sub_agents:
                 self._signal_interrupt()
                 self.publish_action("⏹ 已请求停止当前任务…")
             else:
@@ -633,6 +616,13 @@ class MasterAgent:
             "规划与协作:\n"
             "- todo_write(todos)：写入 / 更新 todo 列表（{content, status} 数组），侧栏会显示。\n"
             "  做多步任务时先开 todo，每完成一项把 status 改成 completed。\n"
+            "  当前真实身份为 master，身份不能通过工具参数指定。\n"
+            "- forum_subscribe(topic, subscribed?)：订阅普通公开主题；forum_pending()列出未闭合问题及责任人。\n"
+            "- forum_wait(after_id?, limit?) / irc_inbox(after_id?, limit?)：按游标读取完整原文，包括回复。\n"
+            "- irc_reply(message_id, content)：答复定向问题；claim_release仅能释放自己的租约。\n"
+            "- team_status()检查真实工作、覆盖率、验证及未决通信；request_close()由程序裁决。\n"
+            "- irc_admin_close(message_id, reason)：仅master可行政关闭无人可答的IRC义务；须写明处理结果/重派去向，保留原参与者审计。\n"
+            "  协作有未完成事项时不得宣告团队完成；预算停止必须明确未完成。普通问答无需创建安全检查任务。\n"
             "- task(description, agent_type?)：派发子任务给一个独立的子 Agent，它有自己的\n"
             "  消息历史，调用工具完成任务后返回结果。复杂、可拆分的子任务用这个。\n"
             "- generate_report(path?, format?, title?)：把会话产出汇总成 Markdown / HTML\n"
@@ -1078,10 +1068,6 @@ class MasterAgent:
                                 "enum": list(SECTIONS.keys()),
                             },
                             "text": {"type": "string"},
-                            "author": {
-                                "type": "string",
-                                "description": "署名（如 master / recon-ab12）",
-                            },
                         },
                         "required": ["section", "text"],
                     },
@@ -1778,14 +1764,38 @@ class MasterAgent:
                 "type": "function",
                 "function": {
                     "name": "forum_wait",
-                    "description": "轮询（非阻塞）发给 master 或公告的新消息。after_id 之后的消息。",
+                    "description": "轮询发给当前真实agent、订阅主题或公告的新消息；after_id之后最早页完整原文。",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "after_id": {"type": "integer", "description": "只看 id 大于此值的消息"},
+                            "limit": {"type": "integer", "description": "每页条数，默认20"},
                         },
                         "required": [],
                     },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_subscribe",
+                    "description": "为当前真实agent订阅或退订公开topic。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "topic": {"type": "string"},
+                            "subscribed": {"type": "boolean"},
+                        },
+                        "required": ["topic"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forum_pending",
+                    "description": "读取未闭合question/help根帖与责任人、超时标识；master查看全队，worker查看自己的义务。",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
             {
@@ -1906,12 +1916,13 @@ class MasterAgent:
                 "type": "function",
                 "function": {
                     "name": "irc_inbox",
-                    "description": "读取发给 master 的定向消息收件箱（可只看未读），内容有界。",
+                    "description": "当前真实agent的定向收件箱，包含答复；after_id之后最早页，正文完整。",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "unread_only": {"type": "boolean", "description": "只返回未读，默认 false"},
                             "limit": {"type": "integer", "description": "最多条数，默认 20"},
+                            "after_id": {"type": "integer", "description": "只返回id大于此值的消息"},
                         },
                         "required": [],
                     },
@@ -1921,7 +1932,7 @@ class MasterAgent:
                 "type": "function",
                 "function": {
                     "name": "irc_reply",
-                    "description": "回复发给 master 的一条定向消息（只有原始收件人能回复）。",
+                    "description": "回复发给当前真实agent的一条定向消息（只有原始收件人能回复）。",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1936,7 +1947,7 @@ class MasterAgent:
                 "type": "function",
                 "function": {
                     "name": "irc_pending",
-                    "description": "列出 master 仍需作答的定向消息（open 状态）。",
+                    "description": "列出当前真实agent仍需作答的定向消息（open状态）。",
                     "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
@@ -1952,6 +1963,21 @@ class MasterAgent:
                             "reason": {"type": "string", "description": "关闭原因"},
                         },
                         "required": ["message_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "irc_admin_close",
+                    "description": "仅master可行政关闭双方均已离线的未决IRC义务；必须提供处理原因，保留原id、双方和正文审计。不等同于原收件人已答复。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "integer", "description": "原消息id"},
+                            "reason": {"type": "string", "description": "处理结论或重派去向，不能为空"},
+                        },
+                        "required": ["message_id", "reason"],
                     },
                 },
             },
@@ -2072,6 +2098,11 @@ class MasterAgent:
         return "(local)"
 
     async def _execute_tool(self, name: str, args: dict) -> str:
+        if self._restoring:
+            return json.dumps({"ok": False, "error": "session restore in progress"})
+        actor = self._actor.get()
+        if actor != "master" and name in self._MASTER_ONLY_TOOLS:
+            return json.dumps({"ok": False, "error": "only master may schedule or transition team work"})
         
         # P2 防御纵深：阶段能力边界。声明期过滤（_active_tool_schemas）之外，
         # 执行期再拒一次——缓存工具列表 / 子 Agent 都无法绕过程序层边界。
@@ -2228,6 +2259,12 @@ class MasterAgent:
             )
             return json.dumps(denial, ensure_ascii=False)
 
+        decision = self.permissions.check(name, args)
+        if decision.action == "deny":
+            return json.dumps(
+                {"error": "denied by permission rule", "tool": name, "rule": decision.reason},
+                ensure_ascii=False,
+            )
         allow_destructive = False
         risk = self._safety_risk_level(name, args)
         if risk == RiskLevel.L4:
@@ -2262,31 +2299,6 @@ class MasterAgent:
                     return json.dumps(denial, ensure_ascii=False)
             allow_destructive = True
 
-        decision = self.permissions.check(name, args)
-        if decision.action == "deny" and not allow_destructive:
-            denial = {
-                "error": "denied by permission rule",
-                "tool": name,
-                "rule": decision.reason,
-            }
-            self.event_bus.publish(
-                Event(
-                    type=EventType.TOOL_CALL,
-                    data={"tool": name, "code": preview, "status": "error", "call_seq": call_seq},
-                )
-            )
-            self.event_bus.publish(
-                Event(
-                    type=EventType.TOOL_RESULT,
-                    data={
-                        "tool": name,
-                        "status": "error",
-                        "output": json.dumps(denial, ensure_ascii=False),
-                        "call_seq": call_seq,
-                    },
-                )
-            )
-            return json.dumps(denial, ensure_ascii=False)
 
         if decision.action == "ask" and not allow_destructive:
             approved = await self._ask_tool_permission(name, preview, decision)
@@ -2418,6 +2430,10 @@ class MasterAgent:
                 result_text = self._tool_forum_digest(args)
             elif name == "forum_wait":
                 result_text = self._tool_forum_wait(args)
+            elif name == "forum_subscribe":
+                result_text = self._tool_forum_subscribe(args)
+            elif name == "forum_pending":
+                result_text = self._tool_forum_pending(args)
             elif name == "forum_pin":
                 result_text = self._tool_forum_pin(args)
             elif name == "forum_close":
@@ -2442,6 +2458,8 @@ class MasterAgent:
                 result_text = self._tool_irc_pending(args)
             elif name == "irc_close":
                 result_text = self._tool_irc_close(args)
+            elif name == "irc_admin_close":
+                result_text = self._tool_irc_admin_close(args)
             elif name == "note_update":
                 result_text = self._tool_note_update(args)
             elif name == "note_read":
@@ -2618,7 +2636,7 @@ class MasterAgent:
                 },
             )
         )
-        if self._current_intent_id and self._sub_exec_depth == 0:
+        if self._current_intent_id and self._actor.get() == "master":
             self.frontier.tick(self._current_intent_id, 1)
             if not name.startswith("intent_"):
                 key = (name, preview)
@@ -2635,7 +2653,7 @@ class MasterAgent:
                         "请换路径或 intent_kill。"
                     )
                     self._set_current_intent(None)
-                if self._sub_exec_depth == 0:
+                if self._actor.get() == "master":
                     total = self.knowledge_base.finding_total()
                     if total > self._stuck_fact_baseline:
                         self._stuck_fact_baseline = total
@@ -2894,7 +2912,7 @@ class MasterAgent:
         if update.pop("owned", False):
             self.knowledge_base.update_target(host)
             self.knowledge_base.mark_owned(host)
-            self.blackboard.add("findings", f"{host}: 已完全控制(owned)", author="master")
+            self.blackboard.add("findings", f"{host}: 已完全控制(owned)", author=self._actor.get())
         self.knowledge_base.update_target(host, **update)
         return json.dumps({"ok": True, "host": host, "updated": list(update.keys()) + (["owned"] if args.get("owned") else [])}, ensure_ascii=False)
 
@@ -2972,7 +2990,7 @@ class MasterAgent:
             )
         self.knowledge_base.add_finding(host, finding)
         board_section = "hypotheses" if status == "suspected" else "findings"
-        self.blackboard.add(board_section, f"{host}: {claim[:120]} [{status}]", author="master")
+        self.blackboard.add(board_section, f"{host}: {claim[:120]} [{status}]", author=self._actor.get())
         return json.dumps(
             {"ok": True, "host": host, "status": status, "claim": claim[:120]},
             ensure_ascii=False,
@@ -3020,9 +3038,7 @@ class MasterAgent:
                 f"⚠ Finding 已推翻（retracted）：{claim[:60]}；"
                 f"级联 kill {killed} 个依赖 Intent。"
             )
-        self.blackboard.add(
-            "findings", f"{host}: {finding.claim[:120]} [{status}]", author="master"
-        )
+        self.blackboard.add("findings", f"{host}: {finding.claim[:120]} [{status}]", author=self._actor.get())
         return json.dumps(
             {"ok": True, "host": host, "claim": finding.claim[:120], "status": status},
             ensure_ascii=False,
@@ -3172,14 +3188,9 @@ class MasterAgent:
         tools = [
             t for t in self._build_tool_schemas()
             if t["function"]["name"] in _VERIFIER_TOOL_NAMES
+            or t["function"]["name"] in self._WORKER_COMMUNICATION_TOOLS
         ]
 
-        async def _sub_executor(name: str, tool_args: dict) -> str:
-            self._sub_exec_depth += 1
-            try:
-                return await self._execute_tool(name, tool_args)
-            finally:
-                self._sub_exec_depth -= 1
 
         sub = SubAgent(
             agent_type=f"verifier-{label}",
@@ -3187,7 +3198,6 @@ class MasterAgent:
             task=task,
             event_bus=self.event_bus,
             llm_provider=self.llm_provider,
-            tool_executor=_sub_executor,
             tool_schemas=tools,
             system_prompt=system_prompt,
             ttl=240,
@@ -3195,11 +3205,10 @@ class MasterAgent:
             parallel_tool_calls=False,
             usage_callback=self._record_usage,
         )
-        self.active_sub_agents[sub.agent_id] = sub
-        try:
-            result = await sub.run()
-        finally:
-            self.active_sub_agents.pop(sub.agent_id, None)
+        self._wire_worker(sub)
+        result = await self._run_worker(sub, work_item=f"verify:{candidate_json}")
+        if result.status is not SubAgentStatus.DONE:
+            return _normalize_verdict({}, note=result.error or result.status.value)
         return _parse_verdict_json(result.text)
 
     async def _tool_verify_finding(self, args: dict) -> str:
@@ -3218,6 +3227,7 @@ class MasterAgent:
 
         if not double:
             finding.verification = verdict_a
+            self._apply_verification(f_host, finding, verdict_a)
             return json.dumps(
                 {
                     "ok": True,
@@ -3234,6 +3244,7 @@ class MasterAgent:
             "verifier_b": verdict_b,
             "adjudicated": adjudicated,
         }
+        self._apply_verification(f_host, finding, adjudicated)
         return json.dumps(
             {
                 "ok": True,
@@ -3243,11 +3254,30 @@ class MasterAgent:
             ensure_ascii=False,
         )
 
+    def _apply_verification(self, host: str, finding: Finding, verdict: dict) -> None:
+        outcome = verdict.get("verdict")
+        if outcome == "confirmed":
+            existing = {e.value for e in finding.evidence}
+            for value in verdict.get("independent_evidence", []):
+                if value and value not in existing:
+                    finding.evidence.append(Evidence(type="verification", value=value, source="independent verifier"))
+                    existing.add(value)
+        if outcome == "confirmed" and finding.evidence:
+            finding.status = "confirmed"
+            finding.verified = True
+        elif outcome == "rejected":
+            finding.status = "retracted"
+            finding.verified = False
+            self.frontier.invalidate(f"{host}::{finding.claim}", "verifier rejected dependency")
+        else:
+            finding.status = "suspected"
+            finding.verified = False
+
     def _tool_blackboard_write(self, args: dict) -> str:
         ok = self.blackboard.add(
             args.get("section", ""),
             args.get("text", ""),
-            author=args.get("author", "") or "master",
+            author=self._actor.get(),
         )
         if not ok:
             return json.dumps(
@@ -3301,7 +3331,7 @@ class MasterAgent:
         if isinstance(refs, str):
             refs = (refs,)
         mid = self.forum.post(
-            "master",
+            self._actor.get(),
             content,
             msg_type=str(args.get("msg_type", "claim") or "claim"),
             epistemic_status=str(args.get("epistemic_status", "hypothesis") or "hypothesis"),
@@ -3316,7 +3346,7 @@ class MasterAgent:
         )
         if mid is None:
             return json.dumps(
-                {"ok": False, "error": "empty content or closed/unknown target thread"},
+                {"ok": False, "error": "empty content, closed/unknown target thread, or forum capacity exhausted"},
                 ensure_ascii=False,
             )
         return json.dumps({"ok": True, "message_id": mid}, ensure_ascii=False)
@@ -3340,10 +3370,23 @@ class MasterAgent:
         return json.dumps({"ok": True, "digest": self.forum.digest()}, ensure_ascii=False)
 
     def _tool_forum_wait(self, args: dict) -> str:
-        after_id = int(args.get("after_id", 0) or 0)
-        msgs = self.forum.wait("master", after_id=after_id)
-        self._forum_cursor = max([self._forum_cursor] + [m["id"] for m in msgs])
+        msgs = self.forum.wait(
+            self._actor.get(), after_id=int(args.get("after_id", 0) or 0),
+            limit=int(args.get("limit", 20) or 20),
+        )
         return json.dumps({"ok": True, "messages": msgs}, ensure_ascii=False)
+
+    def _tool_forum_subscribe(self, args: dict) -> str:
+        actor = self._actor.get()
+        ok = self.forum.subscribe(
+            actor, str(args.get("topic") or ""), bool(args.get("subscribed", True))
+        )
+        return json.dumps({"ok": ok, "subscriptions": self.forum.subscriptions(actor)})
+
+    def _tool_forum_pending(self, args: dict) -> str:
+        actor = self._actor.get()
+        pending = self.forum.pending(None if actor == "master" else actor)
+        return json.dumps({"ok": True, "pending": pending}, ensure_ascii=False)
 
     def _tool_forum_pin(self, args: dict) -> str:
         ok = self.forum.pin(
@@ -3352,6 +3395,12 @@ class MasterAgent:
         return json.dumps({"ok": ok}, ensure_ascii=False)
 
     def _tool_forum_close(self, args: dict) -> str:
+        actor = self._actor.get()
+        root = self.forum._root_of(int(args.get("message_id", 0) or 0))
+        if root is None or actor not in (
+            "master", root.agent_id, root.to or "master"
+        ):
+            return json.dumps({"ok": False, "error": "not the thread author or responsible agent"})
         ok = self.forum.close(
             int(args.get("message_id", 0) or 0),
             reason=str(args.get("reason", "") or ""),
@@ -3362,17 +3411,24 @@ class MasterAgent:
         work_item = str(args.get("work_item", "") or "")
         if not work_item:
             return json.dumps({"ok": False, "error": "work_item is required"}, ensure_ascii=False)
-        ttl = float(args.get("ttl", 600.0) or 600.0)
+        ttl = float(args.get("ttl", 600.0))
         owner = self.claims.owner_of(work_item)
         if owner is not None:
             return json.dumps({"ok": False, "error": f"已被 {owner} 认领"}, ensure_ascii=False)
-        claim_id = self.claims.acquire(work_item, "master", ttl=ttl)
+        actor = self._actor.get()
+        claim_id = self.claims.acquire(work_item, actor, ttl=ttl)
         if claim_id is None:
             return json.dumps({"ok": False, "error": "已被他人认领"}, ensure_ascii=False)
+        if actor != "master":
+            self._worker_claims.setdefault(actor, {})[claim_id] = ttl
         return json.dumps({"ok": True, "claim_id": claim_id}, ensure_ascii=False)
 
     def _tool_claim_release(self, args: dict) -> str:
-        ok = self.claims.release(str(args.get("claim_id", "") or ""))
+        actor = self._actor.get()
+        claim_id = str(args.get("claim_id") or "")
+        ok = self.claims.release(claim_id, owner=actor)
+        if ok:
+            self._worker_claims.get(actor, {}).pop(claim_id, None)
         return json.dumps({"ok": ok}, ensure_ascii=False)
 
     def _tool_claim_status(self, args: dict) -> str:
@@ -3395,30 +3451,51 @@ class MasterAgent:
         return json.dumps({"ok": True, "active": active}, ensure_ascii=False)
 
     def _termination_snapshot(self) -> tuple:
-        coverage: dict = {}
+        intents = list(self.frontier._intents.values())
+        done = [i for i in intents if i.status.value == "done"]
+        critical = [i for i in intents if i.priority <= 1] or intents
+        weight = lambda i: 1.0 / max(1, i.priority + 1)
+        coverage = {
+            "critical_modules": {
+                "covered": sum(i.status.value == "done" for i in critical),
+                "total": len(critical),
+            },
+            "weighted": {"covered": sum(map(weight, done)), "total": sum(map(weight, intents))},
+        }
+        total_budget = sum(max(0, i.budget.max_steps) for i in intents)
+        budget_ratio = sum(i.budget.steps_used for i in intents) / total_budget if total_budget else 0.0
         metrics = self.moderator.extract_metrics(
-            frontier=self.frontier,
-            claims=self.claims,
-            forum=self.forum,
-            knowledge_base=self.knowledge_base,
+            frontier=self.frontier, claims=self.claims, forum=self.forum,
+            knowledge_base=self.knowledge_base, workers=self.active_sub_agents,
+            coverage=coverage, budget_used_ratio=budget_ratio,
         )
-        findings = [f for _h, f in self.knowledge_base.all_findings()]
-        confirmed = sum(
-            1 for f in findings if getattr(f, "status", "") in ("confirmed", "exploited")
-        )
-        quorum = (confirmed / len(findings)) if findings else 0.0
+        quorum = len(done) / len(intents) if intents else 0.0
+        if metrics.pending_verifications or metrics.conflicts:
+            quorum = 0.0
+        metrics.quorum = quorum
         state = self.termination.from_signals(
-            coverage=coverage,
-            pending_verifications=metrics.pending_verifications,
-            quorum=quorum,
+            coverage=coverage, pending_verifications=metrics.pending_verifications,
+            conflicts=metrics.conflicts, quorum=quorum, budget_used_ratio=budget_ratio,
+            open_work=metrics.open_intents + metrics.claimed_intents + len(self.claims.active()),
+            active_workers=len(self.active_sub_agents),
+            pending_messages=len(self.forum.pending()) + len(self._pending_team_irc()),
         )
         decision, reason = self.termination.can_close(state)
         return decision, reason, coverage, quorum, metrics
+
+    def _pending_team_irc(self) -> list[dict]:
+        return [
+            message for message in self.irc.to_dict()["messages"]
+            if message["status"] == "open"
+            or (message["to_agent"] == "master" and not message["read"])
+        ]
 
     def _tool_team_status(self, args: dict) -> str:
         try:
             decision, reason, coverage, quorum, metrics = self._termination_snapshot()
             suggestions = self.moderator.observe(metrics)
+            actor = self._actor.get()
+            pending_irc = self._pending_team_irc()
             return json.dumps(
                 {
                     "ok": True,
@@ -3430,6 +3507,26 @@ class MasterAgent:
                     "quorum": round(quorum, 3),
                     "active_claims": len(self.claims.active()),
                     "forum_messages": self.forum.count(),
+                    "outcome": (
+                        "pending" if decision is not Decision.APPROVE else
+                        "budget_exhausted" if metrics.budget_used_ratio >= 1 else "completed"
+                    ),
+                    "budget_used_ratio": metrics.budget_used_ratio,
+                    "open_work": metrics.open_intents + metrics.claimed_intents,
+                    "active_workers": len(self.active_sub_agents),
+                    "stalled_workers": metrics.stalled_workers,
+                    "roster": [
+                        {"agent_id": sub.agent_id, "type": sub.agent_type,
+                         "target": sub.target, "status": sub.status.value}
+                        for sub in self.active_sub_agents.values()
+                    ],
+                    "forum_pending": self.forum.pending(None if actor == "master" else actor),
+                    "irc_pending_count": len(pending_irc),
+                    "irc_pending": [
+                        m for m in pending_irc if actor == "master"
+                        or actor in (m["from_agent"], m["to_agent"])
+                    ],
+                    "subscriptions": self.forum.subscriptions(actor),
                     "moderator_suggestions": [
                         {
                             "kind": s.kind,
@@ -3449,10 +3546,16 @@ class MasterAgent:
             )
 
     def _tool_request_close(self, args: dict) -> str:
+        if self._actor.get() != "master":
+            return json.dumps({"ok": False, "error": "only master can close the team; return your own task result"})
         try:
             decision, reason, _coverage, _quorum, _metrics = self._termination_snapshot()
             if decision is Decision.APPROVE:
-                note = f"团队终止条件已满足：{reason}"
+                outcome = "budget_exhausted" if _metrics.budget_used_ratio >= 1 else "completed"
+                note = (
+                    f"预算停止（未完成），未决工作及消息已保留：{reason}"
+                    if outcome == "budget_exhausted" else f"团队终止条件已满足：{reason}"
+                )
                 self.event_bus.publish(
                     Event(
                         type=EventType.AGENT_MESSAGE,
@@ -3460,7 +3563,8 @@ class MasterAgent:
                     )
                 )
                 return json.dumps(
-                    {"ok": True, "decision": decision.value, "reason": reason, "note": note},
+                    {"ok": True, "decision": decision.value, "outcome": outcome,
+                     "reason": reason, "note": note},
                     ensure_ascii=False,
                 )
             return json.dumps(
@@ -3468,6 +3572,7 @@ class MasterAgent:
                     "ok": True,
                     "decision": decision.value,
                     "reason": reason,
+                    "outcome": "pending",
                     "instruction": "终止条件尚未满足，请继续工作。",
                 },
                 ensure_ascii=False,
@@ -3484,14 +3589,14 @@ class MasterAgent:
         to_agent = str(args.get("to", "") or "")
         content = str(args.get("content", "") or "")
         reply_to = int(args.get("reply_to", 0) or 0)
-        mid = self.irc.send("master", to_agent, content, reply_to=reply_to)
+        mid = self.irc.send(self._actor.get(), to_agent, content, reply_to=reply_to)
         if mid is None:
             return json.dumps(
                 {
                     "ok": False,
                     "error": (
                         "empty content, self-DM, or reply_to target is not an "
-                        "open message addressed to master"
+                        "open message addressed to the current agent"
                     ),
                 },
                 ensure_ascii=False,
@@ -3500,15 +3605,16 @@ class MasterAgent:
 
     def _tool_irc_inbox(self, args: dict) -> str:
         msgs = self.irc.inbox(
-            "master",
+            self._actor.get(),
             unread_only=bool(args.get("unread_only", False)),
             limit=int(args.get("limit", 20) or 20),
+            after_id=int(args.get("after_id", 0) or 0),
         )
         return json.dumps({"ok": True, "messages": msgs}, ensure_ascii=False)
 
     def _tool_irc_reply(self, args: dict) -> str:
         mid = self.irc.reply(
-            "master",
+            self._actor.get(),
             int(args.get("message_id", 0) or 0),
             str(args.get("content", "") or ""),
         )
@@ -3516,21 +3622,40 @@ class MasterAgent:
             return json.dumps(
                 {
                     "ok": False,
-                    "error": "reply refused: message not found or not addressed to master",
+                    "error": "reply refused: message not found or not addressed to the current agent",
                 },
                 ensure_ascii=False,
             )
         return json.dumps({"ok": True, "message_id": mid}, ensure_ascii=False)
 
     def _tool_irc_pending(self, args: dict) -> str:
-        msgs = self.irc.pending_for("master")
+        msgs = self.irc.pending_for(self._actor.get())
         return json.dumps({"ok": True, "pending": msgs}, ensure_ascii=False)
 
     def _tool_irc_close(self, args: dict) -> str:
         ok = self.irc.close(
             int(args.get("message_id", 0) or 0),
-            agent="master",
+            agent=self._actor.get(),
             reason=str(args.get("reason", "") or ""),
+        )
+        return json.dumps({"ok": ok}, ensure_ascii=False)
+
+    def _tool_irc_admin_close(self, args: dict) -> str:
+        actor = self._actor.get()
+        reason = str(args.get("reason") or "").strip()
+        if actor != "master" or not reason:
+            return json.dumps({"ok": False, "error": "administrative closure requires master and a nonempty reason"})
+        message_id = int(args.get("message_id", 0) or 0)
+        message = self.irc._messages.get(message_id)
+        if message is None:
+            return json.dumps({"ok": False, "error": "message not found"})
+        if any(
+            participant == "master" or participant in self.active_sub_agents
+            for participant in (message.from_agent, message.to_agent)
+        ):
+            return json.dumps({"ok": False, "error": "active participants must reply or close their own message"})
+        ok = self.irc.admin_close(
+            message_id, actor=actor, reason=reason,
         )
         return json.dumps({"ok": ok}, ensure_ascii=False)
 
@@ -3538,7 +3663,7 @@ class MasterAgent:
         section = str(args.get("section", "") or "")
         text = str(args.get("text", "") or "")
         source = str(args.get("source", "") or "")
-        ok = self.project_note.update(section, text, author="master", source=source)
+        ok = self.project_note.update(section, text, author=self._actor.get(), source=source)
         if not ok:
             return json.dumps(
                 {
@@ -3567,24 +3692,16 @@ class MasterAgent:
         return json.dumps({"ok": True, "removed": removed}, ensure_ascii=False)
 
     def _freeze_all_workers(self) -> None:
-        """Cancel every running worker and clear the worker maps on stage change."""
-        for iid in list(self._intent_agent_map.keys()):
-            agent_id = self._intent_agent_map.pop(iid, None)
-            if agent_id is None:
-                continue
-            sub = self.active_sub_agents.get(agent_id)
-            if sub is not None:
-                sub.request_stop()
-            task = self.active_sub_agent_tasks.get(agent_id)
-            if task is not None and not task.done():
-                task.cancel()
+        """Release work before cancellation; runners retain ownership of cleanup."""
+        for iid in list(self._intent_agent_map):
             self.frontier.release(iid)
+        self._intent_agent_map.clear()
+        for sub in list(self.active_sub_agents.values()):
+            sub.request_stop()
+            self.claims.release_owner(sub.agent_id)
         for task in list(self.active_sub_agent_tasks.values()):
             if not task.done():
                 task.cancel()
-        self.active_sub_agents.clear()
-        self.active_sub_agent_tasks.clear()
-        self._intent_agent_map.clear()
 
     def _tool_stage_advance(self, args: dict) -> str:
         from_stage = self.stage_machine.stage
@@ -3939,6 +4056,183 @@ class MasterAgent:
                 return dep.split("::", 1)[0]
         return "frontier-batch"
 
+    _WORKER_COMMUNICATION_TOOLS = frozenset({
+        "forum_post", "forum_read", "forum_threads", "forum_digest", "forum_wait",
+        "forum_pin", "forum_close", "forum_subscribe", "forum_pending",
+        "irc_send", "irc_inbox", "irc_reply", "irc_pending", "irc_close",
+        "claim_acquire", "claim_release", "claim_status", "team_status",
+    })
+
+    _MASTER_ONLY_TOOLS = frozenset({
+        "task", "dispatch_sub_agent", "intent_batch", "stage_advance", "request_close",
+        "intent_add", "intent_claim", "intent_done", "intent_kill", "verify_finding",
+        "irc_admin_close",
+    })
+
+    def _wire_worker(self, sub: SubAgent, intent_id: str | None = None) -> None:
+        """Bind the runtime identity once; neither arguments nor sibling tasks can replace it."""
+        generation = self._session_generation
+        frontier = self.frontier
+        sub.tool_schemas = self.stage_machine.filter_schemas([
+            t for t in sub.tool_schemas if t["function"]["name"] not in self._MASTER_ONLY_TOOLS
+        ])
+        allowed = {t["function"]["name"] for t in sub.tool_schemas}
+
+        async def execute(name: str, args: dict) -> str:
+            if generation != self._session_generation or self._restoring or sub._interrupt:
+                return json.dumps({"ok": False, "error": "worker stopped or session restored"})
+            if name not in allowed:
+                return json.dumps({"ok": False, "error": "tool not granted to this worker"})
+            token = self._actor.set(sub.agent_id)
+            try:
+                result = await self._execute_tool(name, args)
+                if intent_id and self._intent_agent_map.get(intent_id) == sub.agent_id:
+                    status = frontier.tick(intent_id, 1)
+                    if status is not None and status.value == "dead":
+                        sub.request_stop()
+                return result
+            finally:
+                self._actor.reset(token)
+
+        sub.tool_executor = execute
+        sub.system_prompt += (
+            f"\n\n你的真实 agent_id={sub.agent_id}；发送给主控使用 to=master。"
+            "身份由运行时绑定，不接受 author/owner/agent_id 参数。"
+            "先 claim_acquire 再做共享工作，结束释放；已派发意图由主控自动续租。"
+            "topic 普通公开消息需 forum_subscribe 订阅；未决义务用 forum_pending/irc_pending。"
+            "通知摘要不替代原文，长消息请按提示读取；完成自己的任务后返回结果，不关闭整个团队。\n"
+            + self.forum.render_for(sub.agent_id)
+        )
+        sub.notification_provider = lambda: self._pack_notifications(sub.agent_id)
+
+    def _pack_notifications(self, actor: str) -> str:
+        """Two independent FIFO lanes: a busy forum cannot starve IRC answers."""
+        cursors = self._notification_cursors.setdefault(actor, {"forum": 0, "irc": 0})
+        lanes = (
+            ("forum", self.forum.wait(actor, after_id=cursors["forum"], limit=20)),
+            ("irc", self.irc.inbox(actor, after_id=cursors["irc"], limit=20)),
+        )
+        parts = []
+        for channel, messages in lanes:
+            lines = []
+            used = 0
+            delivered = []
+            for message in messages:
+                mid = message["id"]
+                sender = message.get("agent_id", message.get("from_agent", ""))
+                content = message["content"]
+                pointer = (
+                    f" [摘要；原文 forum_read(thread_id={message.get('thread_id') or mid})]"
+                    if channel == "forum"
+                    else f" [摘要；原文 irc_inbox(after_id={mid - 1},limit=1)]"
+                )
+                tag = message.get("epistemic_status", "working state")
+                prefix = f"{channel} #{mid} <{sender[:60]}> [{tag}] "
+                room = 950 - used - len(prefix) - 1
+                if room < min(len(content), 80) + len(pointer):
+                    break
+                rendered = content if len(content) <= room else content[:room - len(pointer)] + pointer
+                line = prefix + rendered
+                lines.append(line)
+                used += len(line) + 1
+                cursors[channel] = mid
+                delivered.append(mid)
+            if lines:
+                parts.append("\n".join(lines))
+            if channel == "irc" and delivered:
+                self.irc.mark_read(actor, message_ids=delivered)
+        return "\n\n".join(parts)
+
+    async def _renew_worker_claims(self, sub: SubAgent, task: asyncio.Task) -> None:
+        while True:
+            leases = self._worker_claims.get(sub.agent_id, {})
+            delay = min([self._lease_interval] + [ttl / 3 for ttl in leases.values()])
+            await asyncio.sleep(max(0.01, delay))
+            for claim_id, ttl in list(leases.items()):
+                if not self.claims.heartbeat(claim_id, ttl=ttl, owner=sub.agent_id):
+                    self.publish_action(f"Worker {sub.agent_id} lost lease {claim_id}; stopping")
+                    sub.request_stop()
+                    task.cancel()
+                    return
+
+    async def _run_worker(
+        self, sub: SubAgent, intent_id: str | None = None, *,
+        work_item: str | None = None, generation: int | None = None,
+    ) -> SubAgentResult:
+        """One lifecycle owns reservation, execution, renewal, and terminal cleanup."""
+        refused = lambda reason: SubAgentResult(
+            agent_id=sub.agent_id, status=SubAgentStatus.CANCELLED, error=reason
+        )
+        if self._restoring or self._interrupt or (
+            generation is not None and generation != self._session_generation
+        ):
+            return refused("dispatch interrupted")
+        generation = self._session_generation if generation is None else generation
+        runner = asyncio.current_task()
+        self._worker_runners.add(runner)
+        self.active_sub_agents[sub.agent_id] = sub
+        self.active_sub_agent_tasks[sub.agent_id] = runner
+        try:
+            await self.scheduler.wait_for_slot()
+        finally:
+            self._worker_runners.discard(runner)
+            self.active_sub_agents.pop(sub.agent_id, None)
+            self.active_sub_agent_tasks.pop(sub.agent_id, None)
+        if self._restoring or self._interrupt or sub._interrupt or generation != self._session_generation:
+            return refused("dispatch interrupted")
+        frontier, claims = self.frontier, self.claims
+        if intent_id and (intent_id in self._intent_agent_map or not frontier.claim(intent_id)):
+            return refused("intent is unavailable or already assigned")
+        if not self.scheduler.try_acquire(sub.target):
+            if intent_id:
+                frontier.release(intent_id)
+            return refused("Target at concurrency capacity")
+        self._worker_runners.add(runner)
+        task = renewal = None
+        result = None
+        try:
+            claim_id = claims.acquire(work_item or f"intent:{intent_id}", sub.agent_id, ttl=600)
+            if claim_id is None:
+                return refused("work already leased")
+            self._worker_claims.setdefault(sub.agent_id, {})[claim_id] = 600
+            if intent_id:
+                self._intent_agent_map[intent_id] = sub.agent_id
+            self.active_sub_agents[sub.agent_id] = sub
+            task = asyncio.create_task(sub.run())
+            self.active_sub_agent_tasks[sub.agent_id] = task
+            renewal = asyncio.create_task(self._renew_worker_claims(sub, task))
+            result = await task
+            return result
+        except Exception as exc:
+            sub.status = SubAgentStatus.ERROR
+            result = SubAgentResult(agent_id=sub.agent_id, status=sub.status, error=str(exc))
+            return result
+        finally:
+            if task is not None and not task.done():
+                sub.request_stop()
+                task.cancel()
+            if renewal is not None:
+                renewal.cancel()
+            await asyncio.gather(*(t for t in (task, renewal) if t is not None), return_exceptions=True)
+            claims.release_owner(sub.agent_id)
+            self._worker_claims.pop(sub.agent_id, None)
+            self.active_sub_agents.pop(sub.agent_id, None)
+            self.active_sub_agent_tasks.pop(sub.agent_id, None)
+            self.scheduler.task_completed(sub.target)
+            self._worker_runners.discard(runner)
+            if intent_id and self._intent_agent_map.get(intent_id) == sub.agent_id:
+                self._intent_agent_map.pop(intent_id, None)
+                if result is not None and result.status is SubAgentStatus.DONE:
+                    frontier.complete(intent_id, result.text or "")
+                elif result is not None and result.status is not SubAgentStatus.CANCELLED:
+                    frontier.kill(intent_id, result.error or result.status.value)
+                else:
+                    frontier.release(intent_id)
+            elif intent_id and frontier.by_id(intent_id) is not None:
+                # Refused leases never owned the map; release only our still-unassigned claim.
+                if intent_id not in self._intent_agent_map:
+                    frontier.release(intent_id)
+
     def _build_worker(self, intent, target: str, agent_type: str) -> SubAgent:
         sub_system = (
             f"你是一个并行探索 Worker（type={agent_type}）。"
@@ -3956,32 +4250,6 @@ class MasterAgent:
             ]
         )
 
-        _intent_holder: dict[str, str] = {"id": intent.id}
-        _agent_id_holder: dict[str, str] = {"id": ""}
-        _notif_cursor: dict[str, int] = {"cursor": 0}
-        _irc_cursor: dict[str, int] = {"cursor": 0}
-
-        async def _sub_executor(name: str, tool_args: dict) -> str:
-            if name != "stage_advance" and not self.stage_machine.is_allowed(name):
-                return json.dumps(
-                    {
-                        "ok": False,
-                        "error": (
-                            f"工具 {name} 在 {self.stage_machine.stage.value} "
-                            "阶段不可用（阶段能力边界）"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-            self._sub_exec_depth += 1
-            try:
-                res = await self._execute_tool(name, tool_args)
-            finally:
-                self._sub_exec_depth -= 1
-            iid = _intent_holder.get("id")
-            if iid:
-                self.frontier.tick(iid, 1)
-            return res
 
         ctx = self._build_context_pack(
             intent.id, scope=None if target == "frontier-batch" else target
@@ -3994,7 +4262,6 @@ class MasterAgent:
             task=f"{intent.hypothesis} —— {intent.action}",
             event_bus=self.event_bus,
             llm_provider=self.llm_provider,
-            tool_executor=_sub_executor,
             tool_schemas=tools,
             system_prompt=sub_system,
             ttl=300,
@@ -4002,106 +4269,40 @@ class MasterAgent:
             parallel_tool_calls=True,
             usage_callback=self._record_usage,
         )
-        # The worker's agent_id exists only after construction, so the forum
-        # view and notification provider are attached post-hoc via mutable
-        # holders captured by the closures.
-        _agent_id_holder["id"] = sub.agent_id
-        sub.system_prompt += "\n\n" + self.forum.render_for(sub.agent_id)
-
-        def _notif_provider() -> str:
-            try:
-                agent_id = _agent_id_holder["id"]
-                parts: list[str] = []
-                msgs = self.forum.wait(
-                    agent_id, after_id=_notif_cursor["cursor"], limit=10
-                )
-                if msgs:
-                    _notif_cursor["cursor"] = max(m["id"] for m in msgs)
-                    lines = []
-                    for m in msgs:
-                        tag = m.get("epistemic_status", "")
-                        lines.append(
-                            f"- #{m['id']} <{m['agent_id']}> [{tag}] "
-                            f"{m['content'][:200]}"
-                        )
-                    parts.append("【论坛通知】\n" + "\n".join(lines))
-                pending_irc = self.irc.pending_for(agent_id, limit=10)
-                new_irc = [m for m in pending_irc if m["id"] > _irc_cursor["cursor"]]
-                if new_irc:
-                    _irc_cursor["cursor"] = max(m["id"] for m in new_irc)
-                    irc_lines = [
-                        f"- #{m['id']} <{m['from_agent']}> {m['content'][:200]}"
-                        for m in new_irc
-                    ]
-                    parts.append("【IRC 定向消息】\n" + "\n".join(irc_lines))
-                return "\n\n".join(parts)
-            except Exception:
-                logger.exception("sub-agent notification provider failed")
-                return ""
-
-        sub.notification_provider = _notif_provider
+        self._wire_worker(sub, intent.id)
         return sub
 
     async def _dispatch_frontier_batch(
-        self,
-        max_workers: int = 4,
-        scope: str | None = None,
-        priority_cap: int = 3,
-        agent_type: str = "general",
+        self, max_workers: int = 4, scope: str | None = None,
+        priority_cap: int = 3, agent_type: str = "general",
     ) -> list[dict]:
-        max_workers = max(1, min(int(max_workers), 4))
+        if self._restoring:
+            return []
         candidates = [
             i for i in self.frontier.list_open_for_stage(self.stage_machine.stage.value)
-            if i.priority <= priority_cap
-        ]
-        if scope:
-            candidates = [
-                i for i in candidates
-                if scope in i.hypothesis or scope in i.action
-            ]
-        pending: list[tuple] = []
-        for intent in candidates[:max_workers]:
-            if not self.frontier.claim(intent.id):
-                continue
-            target = self._target_from_intent(intent)
-            if not self.scheduler.try_acquire(target):
-                self.frontier.release(intent.id)
-                self.publish_action(
-                    f"Worker skipped — target {target} at capacity, "
-                    f"intent {intent.id} released"
-                )
-                continue
-            sub = self._build_worker(intent, target, agent_type)
-            task = asyncio.create_task(sub.run())
-            self.active_sub_agents[sub.agent_id] = sub
-            self.active_sub_agent_tasks[sub.agent_id] = task
-            self._intent_agent_map[intent.id] = sub.agent_id
-            pending.append((intent, target, sub.agent_id, task))
-        results: list[dict] = []
-        for intent, target, agent_id, task in pending:
-            try:
-                result = await task
-            finally:
-                self.scheduler.task_completed(target)
-                self.active_sub_agent_tasks.pop(agent_id, None)
-                self.active_sub_agents.pop(agent_id, None)
-                self._intent_agent_map.pop(intent.id, None)
-            if result.status is SubAgentStatus.DONE:
-                self.frontier.complete(intent.id, (result.text or "")[:200])
-            else:
-                self.frontier.kill(
-                    intent.id, result.error or result.status.value
-                )
-            results.append(
-                {
-                    "intent_id": intent.id,
-                    "hypothesis": intent.hypothesis[:80],
-                    "status": result.status.value,
-                    "text": (result.text or "")[:200],
-                    "error": result.error or "",
-                }
+            if i.priority <= priority_cap and (
+                not scope or scope in i.hypothesis or scope in i.action
             )
-        return results
+        ][:max(1, min(int(max_workers), 4))]
+        pending = []
+        try:
+            for intent in candidates:
+                sub = self._build_worker(intent, self._target_from_intent(intent), agent_type)
+                pending.append((intent, asyncio.create_task(
+                    self._run_worker(sub, intent.id, generation=self._session_generation)
+                )))
+            results = await asyncio.gather(*(task for _, task in pending))
+            return [
+                {"intent_id": intent.id, "hypothesis": intent.hypothesis[:80],
+                 "status": result.status.value, "text": (result.text or "")[:200],
+                 "error": result.error or ""}
+                for (intent, _), result in zip(pending, results)
+            ]
+        finally:
+            for _, task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
 
     async def _tool_intent_batch(self, args: dict) -> str:
         scope = args.get("scope")
@@ -5345,77 +5546,9 @@ class MasterAgent:
         if not description:
             return json.dumps({"error": "description is required"}, ensure_ascii=False)
 
-        sub_system = (
-            f"你是一个专注的子任务 Agent（type={agent_type or 'general'}）。"
-            "主 Agent 委派你完成一个**独立**的子任务。\n"
-            "你看不到主对话历史，所有需要的信息都在用户消息里。\n"
-            "你拥有与主 Agent 相同的工具集（除了 task —— 禁止递归）。\n"
-            "完成任务后返回简洁、结构化的最终答复（包括关键证据），"
-            "主 Agent 会以你的答复为准。失败请如实汇报。"
+        result = await self._dispatch_sub_agent(
+            agent_type or "general", "(sub-agent)", description
         )
-        tools = [
-            t for t in self._build_tool_schemas()
-            if t["function"]["name"] not in ("task", "intent_batch")
-        ]
-
-        _intent_holder: dict[str, str] = {}
-
-        async def _sub_executor(name: str, tool_args: dict) -> str:
-            self._sub_exec_depth += 1
-            try:
-                res = await self._execute_tool(name, tool_args)
-            finally:
-                self._sub_exec_depth -= 1
-            iid = _intent_holder.get("id")
-            if iid:
-                self.frontier.tick(iid, 1)
-            return res
-
-        sub = SubAgent(
-            agent_type=agent_type or "general",
-            target="(sub-agent)",
-            task=description,
-            event_bus=self.event_bus,
-            llm_provider=self.llm_provider,
-            tool_executor=_sub_executor,
-            tool_schemas=tools,
-            system_prompt=sub_system,
-            ttl=300,
-            max_iterations=12,
-            parallel_tool_calls=True,
-            usage_callback=self._record_usage,
-        )
-        intent_id = self.frontier.add_intent(
-            hypothesis=description[:200],
-            action=f"task:{agent_type or 'general'}",
-            priority=TaskPriority.RECON.value,
-            max_steps=sub.max_iterations,
-            expiry_s=float(sub.ttl),
-            stage=self.stage_machine.stage.value,
-        )
-        if intent_id:
-            self.frontier.claim(intent_id)
-            _intent_holder["id"] = intent_id
-            self._intent_agent_map[intent_id] = sub.agent_id
-            ctx = self._build_context_pack(intent_id, scope=None)
-            if ctx:
-                sub.system_prompt = sub.system_prompt + "\n\n" + ctx
-
-        self.active_sub_agents[sub.agent_id] = sub
-        task = asyncio.create_task(sub.run())
-        self.active_sub_agent_tasks[sub.agent_id] = task
-        try:
-            result = await task
-        finally:
-            self.active_sub_agent_tasks.pop(sub.agent_id, None)
-            self.active_sub_agents.pop(sub.agent_id, None)
-            if intent_id:
-                self._intent_agent_map.pop(intent_id, None)
-        if intent_id:
-            if result.status is SubAgentStatus.DONE:
-                self.frontier.complete(intent_id, (result.text or "")[:200])
-            else:
-                self.frontier.kill(intent_id, result.error or result.status.value)
 
         # L7 cross-agent: the sub-agent's full final answer becomes a shared
         # artifact (master keeps a pointer); findings flow via the shared KB.
@@ -6030,6 +6163,7 @@ class MasterAgent:
 
 
     async def _chat_with_image(self, prompt: str, image_path: str) -> None:
+        generation = self._session_generation
         
         import base64
         import mimetypes
@@ -6067,6 +6201,8 @@ class MasterAgent:
         )
         # Append under the chat lock so the image can't be injected into another loop's tool sequence.
         async with self._get_chat_lock():
+            if self._restoring or generation != self._session_generation:
+                return
             self.messages.append({"role": "user", "content": content_blocks})
             await self._run_chat_locked()
 
@@ -6075,34 +6211,73 @@ class MasterAgent:
             self._chat_lock = asyncio.Lock()
         return self._chat_lock
 
+    async def prepare_restore(self) -> None:
+        """Quiesce the old graph before the caller replaces objects without awaiting."""
+        await self._restore_lock.acquire()
+        self._restoring = True
+        self._session_generation += 1
+        chat_locked = False
+        try:
+            self._signal_interrupt()
+            current = asyncio.current_task()
+            tasks = set(self._worker_runners) | set(self.active_sub_agent_tasks.values())
+            if self._chat_task is not None:
+                tasks.add(self._chat_task)
+            tasks.discard(current)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            async with self._approval_lock:
+                pass  # Every displayed approval has now published its resolved event.
+            await self._get_chat_lock().acquire()
+            chat_locked = True
+            for claim in self.claims.active():
+                self.claims.release(claim.claim_id, owner=claim.owner)
+            for request in list(self.safety_gate.get_pending()):
+                self.safety_gate.deny(request.request_id)
+        except BaseException:
+            if chat_locked:
+                self._get_chat_lock().release()
+            self._restoring = False
+            self._restore_lock.release()
+            raise
+
+    def finish_restore(self) -> None:
+        """Complete synchronous replacement while holding the restoration barrier."""
+        try:
+            self.frontier.on_invalidate = self._on_frontier_invalidate
+            self.frontier.reconcile_restored()
+            for claim in self.claims.active():
+                self.claims.release(claim.claim_id, owner=claim.owner)
+            self.safety_gate.reset_session()
+            self.permissions.reset_session()
+            self.active_sub_agents.clear()
+            self.active_sub_agent_tasks.clear()
+            self._worker_runners.clear()
+            self._intent_agent_map.clear()
+            self._worker_claims.clear()
+            self._notification_cursors.clear()
+            self._last_moderator_render = ""
+            self._pending_observer_msg = None
+            self._set_current_intent(None)
+            self._chat_task = None
+            self._chat_active = False
+            self._interrupt = False
+        finally:
+            self._restoring = False
+            self._get_chat_lock().release()
+            self._restore_lock.release()
+
     def _signal_interrupt(self) -> None:
-        
         self._interrupt = True
-        fut = self._iter_continue_future
-        if fut is not None and not fut.done():
-            fut.set_result(False)
-        fut = self._tool_approval_future
-        if fut is not None and not fut.done():
-            fut.set_result(False)
-        fut = self._safety_approval_future
-        if fut is not None and not fut.done():
-            fut.set_result(False)
-        if self._safety_approval_request_id:
-            self.safety_gate.deny(self._safety_approval_request_id)
-        for sub in list(self.active_sub_agents.values()):
-            sub.request_stop()
-        for task in list(self.active_sub_agent_tasks.values()):
-            if not task.done():
-                task.cancel()
+        if self._approval_future is not None and not self._approval_future.done():
+            self._approval_future.set_result(False)
+        self._freeze_all_workers()
 
     def shutdown(self) -> None:
         """Release subprocess-backed resources (PTY shells, OOB listener)."""
-        for task in list(self.active_sub_agent_tasks.values()):
-            if not task.done():
-                task.cancel()
-        self.active_sub_agent_tasks.clear()
-        self.active_sub_agents.clear()
-        self._intent_agent_map.clear()
+        self._signal_interrupt()
         try:
             self.shells.close_all()
         except Exception:
@@ -6113,8 +6288,11 @@ class MasterAgent:
             logging.getLogger(__name__).exception("OOB listener cleanup failed")
 
     async def _chat_with_llm(self, user_text: str, _skip_user_message: bool = False) -> None:
+        generation = self._session_generation
         
         async with self._get_chat_lock():
+            if self._restoring or generation != self._session_generation:
+                return
             if not _skip_user_message:
                 self.messages.append({"role": "user", "content": user_text})
             await self._run_chat_locked()
@@ -6125,22 +6303,21 @@ class MasterAgent:
         system_prompt = self._build_system_prompt()
         self._chat_active = True
         self._interrupt = False
+        self._chat_task = asyncio.current_task()
+        token = self._actor.set("master")
         try:
             await self._chat_loop(tools, system_prompt)
         finally:
             self._chat_active = False
             self._interrupt = False
+            self._chat_task = None
+            self._actor.reset(token)
 
     def _maybe_tick_moderator(self) -> None:
         try:
             if not self.moderator.should_run():
                 return
-            metrics = self.moderator.extract_metrics(
-                frontier=self.frontier,
-                claims=self.claims,
-                forum=self.forum,
-                knowledge_base=self.knowledge_base,
-            )
+            _, _, _, _, metrics = self._termination_snapshot()
             suggestions = self.moderator.tick(metrics)
             if not suggestions:
                 return
@@ -6159,22 +6336,21 @@ class MasterAgent:
             logger.exception("moderator tick failed")
 
     def _collaboration_block(self) -> str:
-        try:
-            parts = [self.forum.digest()]
-            active = self.claims.active()
-            if active:
-                lines = [f"- {c.work_item} ← {c.owner}" for c in active[:8]]
-                parts.append("【活跃认领 Claim】\n" + "\n".join(lines))
-            else:
-                parts.append("【活跃认领 Claim】\n(空)")
-            if self._last_moderator_render:
-                parts.append(self._last_moderator_render)
-            text = "\n\n".join(parts)
-            if len(text) > 800:
-                text = text[:799] + "…"
-            return text
-        except Exception:
-            return ""
+        parts = [self.forum.render_for("master", max_chars=800)]
+        active = self.claims.active()
+        if active:
+            parts.append("【活跃认领】\n" + "\n".join(
+                f"- {c.work_item[:120]} ← {c.owner}" for c in active[:8]
+            ))
+        overdue = [m for m in self.forum.pending() if m["overdue"]]
+        if overdue:
+            parts.append("【升级给 master：仍为原线程的未决义务】\n" + "\n".join(
+                f"- forum #{m['id']} owner={m['owner']} 已超时；forum_read(thread_id={m['id']})"
+                for m in overdue
+            ))
+        if self._last_moderator_render:
+            parts.append(self._last_moderator_render)
+        return "\n\n".join(parts)
 
     async def _chat_loop(self, tools, system_prompt) -> None:
         iteration = 0
@@ -6219,6 +6395,15 @@ class MasterAgent:
                     )
                     continue
             self._maybe_tick_moderator()
+            tools = self._active_tool_schemas()
+            system_prompt = self._build_system_prompt()
+            notifications = self._pack_notifications("master")
+            if notifications:
+                self.messages.append({"role": "user", "content": notifications})
+            collaborative = bool(
+                self.frontier._intents or self.active_sub_agents
+                or self.forum.pending() or self._pending_team_irc()
+            )
             request_messages = [
                 {"role": "system", "content": system_prompt + "\n\n" + self.frontier.view()},
                 *self.messages,
@@ -6250,8 +6435,9 @@ class MasterAgent:
                         if kind_value == "text":
                             if ev.content:
                                 text_parts.append(ev.content)
-                                self._publish_stream_delta(stream_id, ev.content, stream_opened)
-                                stream_opened = True
+                                if not collaborative:
+                                    self._publish_stream_delta(stream_id, ev.content, stream_opened)
+                                    stream_opened = True
                         elif kind_value == "tool_call":
                             pending_calls.append({
                                 "id": (ev.metadata or {}).get("tool_call_id", ""),
@@ -6291,6 +6477,21 @@ class MasterAgent:
 
             raw_text = "".join(text_parts)
             text_reply = raw_text.strip()
+            if collaborative and not pending_calls and not error_seen:
+                decision, reason, _, _, metrics = self._termination_snapshot()
+                if metrics.budget_used_ratio >= 1:
+                    self._freeze_all_workers()
+                    workers = set(self._worker_runners) | set(self.active_sub_agent_tasks.values())
+                    workers.discard(asyncio.current_task())
+                    await asyncio.gather(*workers, return_exceptions=True)
+                    decision, reason, _, _, metrics = self._termination_snapshot()
+                    text_reply = f"预算已耗尽，本轮停止（未完成）：{reason}。未决工作与通信保留，可用 team_status 查看。"
+                elif decision is not Decision.APPROVE:
+                    text_reply = f"本轮已暂停，团队尚未完成：{reason}。请用 team_status 查看未决工作，不能将本轮回复当作团队完成。"
+                raw_text = text_reply
+            if collaborative and raw_text and not error_seen:
+                self._publish_stream_delta(stream_id, raw_text, False)
+                stream_opened = True
             if stream_opened:
                 # Finalize the bubble with the raw (un-stripped) text so delta-arrived trailing whitespace isn't lost from the display.
                 self._publish_stream_end(stream_id, raw_text)
@@ -6400,71 +6601,58 @@ class MasterAgent:
     async def _ask_tool_permission(
         self, tool_name: str, preview: str, decision: Any
     ) -> bool:
-        
-        async with self._tool_approval_lock:
-            loop = asyncio.get_running_loop()
-            fut = loop.create_future()
-            self._tool_approval_future = fut
-            self._tool_approval_args = (tool_name, decision.args_repr or "")
-
-            self.event_bus.publish(
-                Event(
-                    type=EventType.APPROVAL_REQUEST,
-                    data={
-                        "request_id": f"perm:{tool_name}",
-                        "operation": f"{tool_name} — {preview}",
-                        "risk_level": "L2",
-                        "target": "(permission gate)",
-                        "requires_approval": True,
-                        "requires_confirmation_phrase": False,
-                        "rule": decision.reason,
-                    },
-                )
-            )
-            self.publish_action(
-                f"工具 {tool_name} 需要授权: {decision.reason} "
-                f"[y]批准本次 / [a]总是允许本工具 / [n]拒绝"
-            )
-
-            try:
-                approved = await fut
-            finally:
-                self._tool_approval_future = None
-                self._tool_approval_args = None
-        return bool(approved)
+        return await self._await_approval(
+            kind="permission", operation=f"{tool_name} — {preview}",
+            target="(permission gate)", risk_level="L2", tool_name=tool_name,
+            rule=decision.reason,
+        )
 
     async def _ask_continue_iteration(self, steps_so_far: int) -> bool:
-        
-        if self._iter_continue_future is not None and not self._iter_continue_future.done():
-            self._iter_continue_future.set_result(False)
-
-        loop = asyncio.get_running_loop()
-        self._iter_continue_future = loop.create_future()
-
-        self.event_bus.publish(
-            Event(
-                type=EventType.APPROVAL_REQUEST,
-                data={
-                    "request_id": "iter_continue",
-                    "operation": (
-                        f"已执行 {steps_so_far} 步工具调用，是否继续推理？"
-                    ),
-                    "risk_level": "L1",
-                    "target": "(iteration soft-limit)",
-                    "requires_approval": True,
-                    "requires_confirmation_phrase": False,
-                },
-            )
-        )
-        self.publish_action(
-            f"已执行 {steps_so_far} 步工具调用。继续推理请输入 [y]，停止请输入 [n]。"
+        return await self._await_approval(
+            kind="iteration", operation=f"已执行 {steps_so_far} 步工具调用，是否继续推理？",
+            target="(iteration soft-limit)", risk_level="L1",
         )
 
+    async def _await_approval(
+        self, *, kind: str, operation: str, target: str, risk_level: str,
+        request_id: str | None = None, requires_confirmation_phrase: bool = False,
+        timeout: float = 600.0, **details,
+    ) -> bool:
+        generation = self._session_generation
         try:
-            approved = await self._iter_continue_future
+            async with self._approval_lock:
+                if self._restoring or generation != self._session_generation or self._interrupt:
+                    return False
+                request = {
+                    **details, "kind": kind,
+                    "request_id": request_id or f"{kind}:{uuid.uuid4().hex}",
+                    "agent_id": self._actor.get(), "operation": operation,
+                    "target": target, "risk_level": risk_level,
+                    "requires_approval": True,
+                    "requires_confirmation_phrase": requires_confirmation_phrase,
+                }
+                future = asyncio.get_running_loop().create_future()
+                self._approval_request = request
+                self._approval_future = future
+                approved = False
+                try:
+                    self.event_bus.publish(Event(type=EventType.APPROVAL_REQUEST, data=request))
+                    approved = bool(await asyncio.wait_for(future, timeout=timeout))
+                    return approved
+                except asyncio.TimeoutError:
+                    return False
+                finally:
+                    self._approval_future = None
+                    self._approval_request = None
+                    self.event_bus.publish(Event(
+                        type=EventType.APPROVAL_RESOLVED,
+                        data={"request_id": request["request_id"], "approved": approved},
+                    ))
         finally:
-            self._iter_continue_future = None
-        return bool(approved)
+            if kind == "safety" and request_id:
+                # approve() already removes an accepted request; this also clears
+                # queued requests cancelled before they could acquire the lock.
+                self.safety_gate.deny(request_id)
 
     async def _handle_scan_command(self, text: str) -> None:
         
@@ -6742,7 +6930,8 @@ class MasterAgent:
         bind_intent: str | None = None,
     ) -> SubAgentResult:
         
-        await self.scheduler.wait_for_slot()
+        if self._restoring or self._interrupt:
+            return SubAgentResult(agent_id="", status=SubAgentStatus.CANCELLED, error="dispatch interrupted")
 
         sub_system = (
             f"你是一个专注的 {agent_type} 子任务 Agent。"
@@ -6770,18 +6959,6 @@ class MasterAgent:
             if t["function"]["name"] not in ("task", "intent_batch")
         ]
 
-        _intent_holder: dict[str, str] = {}
-
-        async def _sub_executor(name: str, tool_args: dict) -> str:
-            self._sub_exec_depth += 1
-            try:
-                res = await self._execute_tool(name, tool_args)
-            finally:
-                self._sub_exec_depth -= 1
-            iid = _intent_holder.get("id")
-            if iid:
-                self.frontier.tick(iid, 1)
-            return res
 
         sub = SubAgent(
             agent_type=agent_type,
@@ -6789,7 +6966,6 @@ class MasterAgent:
             task=task,
             event_bus=self.event_bus,
             llm_provider=self.llm_provider,
-            tool_executor=_sub_executor,
             tool_schemas=tools,
             system_prompt=sub_system,
             ttl=300,
@@ -6798,16 +6974,6 @@ class MasterAgent:
             usage_callback=self._record_usage,
         )
 
-        if not self.scheduler.try_acquire(target):
-            self.publish_action(
-                f"Sub-agent {sub.agent_id} skipped — target {target} at capacity"
-            )
-            return SubAgentResult(
-                agent_id=sub.agent_id,
-                status=sub.status,
-                scripts_executed=0,
-                error="Target at concurrency capacity",
-            )
 
         findings_before = self.knowledge_base.finding_total()
         targets_before = {t["host"] for t in self.knowledge_base.list_targets()}
@@ -6823,30 +6989,16 @@ class MasterAgent:
                 expiry_s=float(sub.ttl),
                 stage=self.stage_machine.stage.value,
             )
-        if intent_id:
-            self.frontier.claim(intent_id)
-            _intent_holder["id"] = intent_id
-            self._intent_agent_map[intent_id] = sub.agent_id
-            ctx = self._build_context_pack(intent_id, scope=target)
-            if ctx:
-                sub.system_prompt = sub.system_prompt + "\n\n" + ctx
-
-        self.active_sub_agents[sub.agent_id] = sub
-        task = asyncio.create_task(sub.run())
-        self.active_sub_agent_tasks[sub.agent_id] = task
-        try:
-            result = await task
-        finally:
-            self.scheduler.task_completed(target)
-            self.active_sub_agent_tasks.pop(sub.agent_id, None)
-            self.active_sub_agents.pop(sub.agent_id, None)
-            if intent_id:
-                self._intent_agent_map.pop(intent_id, None)
-        if intent_id:
-            if result.status is SubAgentStatus.DONE:
-                self.frontier.complete(intent_id, (result.text or "")[:200])
-            else:
-                self.frontier.kill(intent_id, result.error or result.status.value)
+        if not intent_id:
+            return SubAgentResult(
+                agent_id=sub.agent_id, status=SubAgentStatus.CANCELLED,
+                error="duplicate or invalid work; no worker launched",
+            )
+        ctx = self._build_context_pack(intent_id, scope=target)
+        if ctx:
+            sub.system_prompt += "\n\n" + ctx
+        self._wire_worker(sub, intent_id)
+        result = await self._run_worker(sub, intent_id, work_item=f"dispatch:{target}:{task}")
         result.findings = self.knowledge_base.findings_since(findings_before)
         result.new_targets = [
             h
@@ -6902,58 +7054,15 @@ class MasterAgent:
 
 
     async def _await_safety_approval(
-        self,
-        request_id: Optional[str],
-        operation: str,
-        risk_level: RiskLevel,
-        target: str,
-        requires_approval: bool,
-        requires_confirmation_phrase: bool,
+        self, request_id: Optional[str], operation: str, risk_level: RiskLevel,
+        target: str, requires_approval: bool, requires_confirmation_phrase: bool,
         timeout: float = 600.0,
     ) -> bool:
-        async with self._safety_approval_lock:
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future = loop.create_future()
-            self._safety_approval_future = fut
-            self._safety_approval_request_id = request_id
-            self._safety_approval_requires_phrase = requires_confirmation_phrase
-
-            self.event_bus.publish(
-                Event(
-                    type=EventType.APPROVAL_REQUEST,
-                    data={
-                        "request_id": request_id,
-                        "operation": operation,
-                        "risk_level": risk_level.value,
-                        "target": target,
-                        "requires_approval": requires_approval,
-                        "requires_confirmation_phrase": requires_confirmation_phrase,
-                    },
-                )
-            )
-            if requires_confirmation_phrase:
-                self.publish_action(
-                    f"破坏性操作 {operation}（target={target}）需要确认。"
-                    f"请输入精确短语「{DESTROY_CONFIRMATION_PHRASE}」以继续。"
-                )
-            else:
-                self.publish_action(
-                    f"操作 {operation}（target={target}）需要审批 "
-                    f"[y]批准 / [n]拒绝 / [v]查看详情"
-                )
-
-            try:
-                approved = await asyncio.wait_for(fut, timeout=timeout)
-            except asyncio.TimeoutError:
-                if request_id:
-                    self.safety_gate.deny(request_id)
-                self.publish_action(f"审批超时，操作 {operation} 已拒绝。")
-                approved = False
-            finally:
-                self._safety_approval_future = None
-                self._safety_approval_request_id = None
-                self._safety_approval_requires_phrase = False
-        return bool(approved)
+        return await self._await_approval(
+            kind="safety", request_id=request_id, operation=operation, target=target,
+            risk_level=risk_level.value,
+            requires_confirmation_phrase=requires_confirmation_phrase, timeout=timeout,
+        )
 
     def _publish_approval_details(self, request_id: Optional[str]) -> None:
         for req in self.safety_gate.get_pending():
@@ -6989,86 +7098,30 @@ class MasterAgent:
         )
 
     async def _handle_approval_response(self, event: Event) -> None:
-        
-        raw_response = (event.data.get("response") or "").strip().lower()
-        raw_response_exact = (event.data.get("response") or "").strip()
-        approved_field = event.data.get("approved")
-        always = raw_response in ("a", "always", "总是")
-        if approved_field is None and raw_response:
-            approved_field = raw_response in ("y", "yes", "继续") or always
-
-        # Tool-permission prompt takes priority over the iteration prompt.
+        request, future = self._approval_request, self._approval_future
         if (
-            self._tool_approval_future is not None
-            and not self._tool_approval_future.done()
+            request is None or future is None or future.done()
+            or not event.data.get("request_id")
+            or event.data["request_id"] != request["request_id"]
         ):
-            granted = bool(approved_field)
-            if granted and always and self._tool_approval_args is not None:
-                tool_name, _ = self._tool_approval_args
-                self.permissions.grant_session(tool_name)
-                self.publish_action(f"已永久授权工具 {tool_name}（本会话内）")
-            self._tool_approval_future.set_result(granted)
             return
-
-        # Iteration-continue prompt takes priority when active.
-        if (
-            self._iter_continue_future is not None
-            and not self._iter_continue_future.done()
-            and event.data.get("request_id") in (None, "iter_continue")
-        ):
-            self._iter_continue_future.set_result(bool(approved_field))
+        exact = event.data.get("response") or ""
+        response = exact.strip().lower()
+        if response == "v" and request["kind"] == "safety":
+            self._publish_approval_details(request["request_id"])
             return
-
-        if (
-            self._safety_approval_future is not None
-            and not self._safety_approval_future.done()
-        ):
-            req_id = self._safety_approval_request_id
-            if raw_response == "v":
-                self._publish_approval_details(req_id)
-                return
-            if self._safety_approval_requires_phrase:
-                # L4: only the exact (case-sensitive) confirmation phrase approves.
-                if raw_response_exact == DESTROY_CONFIRMATION_PHRASE:
-                    if req_id:
-                        self.safety_gate.approve(req_id)
-                    self._safety_approval_future.set_result(True)
-                else:
-                    if req_id:
-                        self.safety_gate.deny(req_id)
-                    self.publish_action(
-                        f"拒绝：破坏性操作需要输入精确确认短语「{DESTROY_CONFIRMATION_PHRASE}」。"
-                    )
-                    self._safety_approval_future.set_result(False)
-                return
-            if bool(approved_field):
-                if req_id:
-                    self.safety_gate.approve(req_id)
-                self._safety_approval_future.set_result(True)
-            else:
-                if req_id:
-                    self.safety_gate.deny(req_id)
-                self._safety_approval_future.set_result(False)
-            return
-
-        request_id = event.data.get("request_id")
-        approved = bool(approved_field)
-
-        if approved:
-            if request_id and self.safety_gate.approve(request_id):
-                self.publish_action(
-                    f"Operation approved (request {request_id})"
-                )
-            elif request_id:
-                self.publish_action(
-                    f"Approval request {request_id} not found (already processed)"
-                )
+        if request["requires_confirmation_phrase"]:
+            approved = exact == DESTROY_CONFIRMATION_PHRASE
         else:
-            if request_id:
-                self.safety_gate.deny(request_id)
-                self.publish_action(
-                    f"Operation denied (request {request_id})"
-                )
+            approved = bool(event.data.get("approved", response in ("y", "yes", "继续", "a", "always", "总是")))
+        if request["kind"] == "safety":
+            if approved:
+                approved = self.safety_gate.approve(request["request_id"])
+            else:
+                self.safety_gate.deny(request["request_id"])
+        elif approved and request["kind"] == "permission" and response in ("a", "always", "总是"):
+            self.permissions.grant_session(request["tool_name"])
+        future.set_result(approved)
 
 
     def create_evidence(

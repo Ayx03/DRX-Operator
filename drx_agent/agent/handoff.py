@@ -25,6 +25,8 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 
+from drx_agent.agent.consensus import verification_outcome
+
 # Epistemic status enum. "observed" = directly witnessed; "inferred" = deduced
 # from evidence; "hypothesis" = proposed, unproven; "verified" = confirmed by
 # evidence; "rejected" = tried and excluded.
@@ -193,11 +195,10 @@ class Handoff:
             evidence: list[str] = [str(e) for e in (getattr(intent, "evidence", None) or ())]
             producer = str(getattr(intent, "actor", "frontier") or "frontier")
             if intent_status == "done":
-                result = str(getattr(intent, "result", "") or "")
+                result = str(getattr(intent, "result", "") or "").strip()
                 if result:
-                    evidence.append(f"result: {result}")
-                h.add("facts", hypothesis, status="observed", confidence=0.9,
-                      producer=producer, evidence=evidence)
+                    h.add("hypotheses", result, status="inferred",
+                          producer=producer, evidence=evidence)
             elif intent_status in ("open", "claimed"):
                 h.add("hypotheses", hypothesis, status="hypothesis",
                       producer=producer, evidence=evidence)
@@ -210,15 +211,26 @@ class Handoff:
                   status="rejected", confidence=0.9,
                   producer=f"frontier/{getattr(dead, 'intent_id', '?')}",
                   counterevidence=[reason] if reason else [])
-        status_map = {"suspected": "hypothesis", "confirmed": "verified",
-                      "exploited": "verified", "retracted": "rejected"}
         for host, finding in knowledge_base.all_findings():
-            status = status_map.get(str(getattr(finding, "status", "suspected")), "inferred")
-            evidence = [f"{e.type}: {e.value or e.cve or e.payload}"
-                        for e in (getattr(finding, "evidence", None) or [])
-                        if e.value or e.cve or e.payload]
+            verdict, conflict = verification_outcome(finding)
+            status = {
+                "confirmed": "verified", "rejected": "rejected",
+                "pending": "hypothesis",
+            }.get(verdict, "inferred")
+            if conflict or getattr(finding, "status", "") == "suspected":
+                status = "hypothesis"
+            evidence = [
+                f"{e.type}: {e.value or e.cve or e.payload or e.result or e.evidence_id}"
+                for e in (getattr(finding, "evidence", None) or [])
+                if e.value or e.cve or e.payload or e.result or e.evidence_id
+            ]
+            verification = getattr(finding, "verification", None) or {}
+            effective = verification.get("adjudicated", verification)
+            evidence.extend(_str_list(effective.get("independent_evidence")))
             superseded = str(getattr(finding, "superseded_by", "") or "")
-            counterevidence = [f"superseded_by: {superseded}"] if superseded else []
+            counterevidence = _str_list(effective.get("counterevidence"))
+            if superseded:
+                counterevidence.append(f"superseded_by: {superseded}")
             h.add("candidates", str(getattr(finding, "claim", "") or ""),
                   status=status, confidence=float(getattr(finding, "confidence", 0.5) or 0.5),
                   producer="knowledge_base", evidence=evidence,

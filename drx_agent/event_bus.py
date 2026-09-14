@@ -14,6 +14,7 @@ class EventType(Enum):
     SUB_AGENT_RESULT = "sub_agent_result"
     APPROVAL_REQUEST = "approval_request"
     APPROVAL_RESPONSE = "approval_response"
+    APPROVAL_RESOLVED = "approval_resolved"
     TARGET_SWITCH = "target_switch"
     SESSION_SAVE = "session_save"
     SESSION_RESTORE = "session_restore"

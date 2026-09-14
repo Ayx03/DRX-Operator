@@ -233,6 +233,20 @@ class Frontier:
         for intent in self._intents.values():
             intent.budget.created_ts = now
 
+    def reconcile_restored(self) -> int:
+        """Return orphaned claims to the queue without refunding consumed steps.
+
+        A restored snapshot has no live workers. Restart wall-clock expiry for
+        resumable work, but keep step consumption and terminal outcomes intact.
+        """
+        released = 0
+        for intent in self._intents.values():
+            if self.release(intent.id):
+                released += 1
+                self._append_event("intent.restored", {"intent_id": intent.id})
+        self.rebase_budgets()
+        return released
+
     def prune_expired(self, now: float | None = None) -> int:
         now = time.time() if now is None else now
         killed = 0

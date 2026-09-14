@@ -82,6 +82,8 @@ class SubAgent:
         self.stop_on_pattern = stop_on_pattern
         self.status = SubAgentStatus.QUEUED
         self._interrupt = False
+        self.started_at: float | None = None
+        self.last_activity_at: float | None = None
 
     def request_stop(self) -> None:
         """Cooperative stop; the owning task should also be cancelled."""
@@ -93,6 +95,7 @@ class SubAgent:
 
     async def run(self) -> SubAgentResult:
         self.status = SubAgentStatus.RUNNING
+        self.started_at = self.last_activity_at = time.time()
         self.event_bus.publish(
             Event(
                 type=EventType.SUB_AGENT_DISPATCH,
@@ -168,7 +171,7 @@ class SubAgent:
                     note = ""
                 if note:
                     messages.append(
-                        {"role": "user", "content": "<新论坛通知>\n" + note[:2000]}
+                        {"role": "user", "content": "<新论坛通知>\n" + note}
                     )
 
             text_parts: list[str] = []
@@ -182,6 +185,7 @@ class SubAgent:
                     async for ev in self.llm_provider.chat(
                         messages, tools=self.tool_schemas, stream=False
                     ):
+                        self.last_activity_at = time.time()
                         if self._interrupt:
                             error_seen = self._mark_cancelled(error_seen)
                             break
@@ -282,9 +286,16 @@ class SubAgent:
         executor = self.tool_executor
         if executor is None:
             return 0
+
+        async def execute(call: dict):
+            try:
+                return await executor(call["name"], call["input"])
+            finally:
+                self.last_activity_at = time.time()
+
         executed = 0
         if self.parallel_tool_calls and len(pending_calls) > 1:
-            coros = [executor(c["name"], c["input"]) for c in pending_calls]
+            coros = [execute(c) for c in pending_calls]
             try:
                 results = await asyncio.gather(*coros, return_exceptions=True)
             except asyncio.CancelledError:
@@ -311,7 +322,7 @@ class SubAgent:
                 self.status = SubAgentStatus.CANCELLED
                 break
             try:
-                res = await executor(call["name"], call["input"])
+                res = await execute(call)
             except asyncio.CancelledError:
                 self.status = SubAgentStatus.CANCELLED
                 raise

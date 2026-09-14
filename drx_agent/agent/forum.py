@@ -30,6 +30,7 @@ module stays cycle-free.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -99,7 +100,7 @@ class Message:
     epistemic_status: str = "hypothesis"
     scope: str = ""
     references: tuple[str, ...] = ()  # e.g. E-xxxx / intent ids
-    ttl: float = 0.0  # 0 = never expires
+    ttl: float = 0.0  # 0 = no deadline; elapsed deadlines never delete obligations
     created_at: float = field(default_factory=time.time)
     pinned: bool = False
     closed: bool = False
@@ -171,6 +172,7 @@ class Forum:
         self.max_messages: int = int(max_messages or MAX_MESSAGES)
         self._messages: dict[int, Message] = {}
         self._next_id: int = 1
+        self._subscriptions: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------- internals
 
@@ -178,6 +180,12 @@ class Forum:
         if m.announcement:
             return True
         return m.msg_type in _BROADCAST_TYPES and m.to == ""
+
+    def _addresses(self, m: Message, agent_id: str) -> bool:
+        return (
+            m.to == agent_id or self._is_broadcast(m)
+            or (not m.to and m.topic in self._subscriptions.get(agent_id, ()))
+        )
 
     def _root_of(self, message_id: int) -> Message | None:
         m = self._messages.get(message_id)
@@ -199,15 +207,31 @@ class Forum:
                 else:
                     m.moderation_reason = ""
 
-    def _prune(self) -> None:
-        """Drop oldest non-pinned messages past ``max_messages``."""
-        if len(self._messages) <= self.max_messages:
-            return
-        overflow = len(self._messages) - self.max_messages
-        droppable = [m for m in self._messages.values() if not m.pinned]
-        droppable.sort(key=lambda m: m.created_at)
-        for m in droppable[:overflow]:
-            del self._messages[m.id]
+    def _make_room(self, protected_thread: int = 0) -> bool:
+        """Reserve one slot by evicting whole safe threads, or change nothing."""
+        needed = len(self._messages) + 1 - self.max_messages
+        if needed <= 0:
+            return True
+        roots = [
+            m for m in self._messages.values()
+            if m.reply_to == 0 and not m.pinned and m.id != protected_thread
+            and (m.closed or m.msg_type not in ("question", "help"))
+        ]
+        roots.sort(key=lambda m: (m.created_at, m.id))
+        members: dict[int, list[int]] = {m.id: [] for m in roots}
+        for m in self._messages.values():
+            if m.thread_id in members:
+                members[m.thread_id].append(m.id)
+        evict: list[int] = []
+        for root in roots:
+            evict.extend(members[root.id])
+            if len(evict) >= needed:
+                break
+        if len(evict) < needed:
+            return False
+        for mid in evict:
+            del self._messages[mid]
+        return True
 
     # ----------------------------------------------------------------- post
 
@@ -229,8 +253,8 @@ class Forum:
     ) -> int | None:
         """Append a typed message; return its id, or ``None`` when rejected.
 
-        Rejected when ``content`` is empty, or the target thread is closed
-        (replies to a closed thread are refused). Anti-broadcast: only
+        Rejected when ``content`` is empty, the target thread is closed, or
+        capacity cannot be freed without losing a pinned/unresolved thread.
         ``announcement=True`` or ``correction``/``evidence`` with ``to=""``
         addresses everyone; a plain public post is topic-scoped.
         """
@@ -246,7 +270,14 @@ class Forum:
         topic = str(topic or "")
         to = str(to or "")
 
+        ttl = float(ttl)
+        if not math.isfinite(ttl) or ttl < 0:
+            raise ValueError("ttl must be finite and nonnegative")
+        created_at = time.time()
+        if not math.isfinite(created_at + ttl):
+            raise ValueError("ttl must produce a finite deadline")
         thread_id = 0
+        root = None
         if reply_to != 0:
             root = self._root_of(reply_to)
             if root is None or root.closed:
@@ -255,6 +286,8 @@ class Forum:
             if not topic:
                 topic = root.topic
 
+        if not self._make_room(thread_id):
+            return None
         mid = self._next_id
         self._next_id += 1
         if reply_to == 0:
@@ -273,11 +306,11 @@ class Forum:
             epistemic_status=epistemic_status,
             scope=str(scope or ""),
             references=references,
-            ttl=float(ttl or 0.0),
-            created_at=time.time(),
+            ttl=ttl,
+            created_at=created_at,
+            pinned=bool(root and root.pinned),
             announcement=bool(announcement),
         )
-        self._prune()
         return mid
 
     # ----------------------------------------------------------------- read
@@ -317,16 +350,53 @@ class Forum:
         return out[: int(limit)]
 
     def wait(self, agent_id: str, *, after_id: int = 0, limit: int = 20) -> list[dict]:
-        """Poll (non-blocking): messages addressed to ``agent_id`` or public
-        announcements/broadcasts with id > ``after_id``. ``[]`` when nothing new."""
+        """Earliest messages after the cursor: directed, broadcast, or public
+        posts in a subscribed topic. Polling never blocks or consumes messages."""
         after_id = int(after_id or 0)
         limit = max(int(limit or 20), 1)
         msgs = [
             m for m in self._messages.values()
-            if m.id > after_id and (m.to == agent_id or self._is_broadcast(m))
+            if m.id > after_id and self._addresses(m, agent_id)
         ]
         msgs.sort(key=lambda m: m.id)
         return [m.to_dict() for m in msgs[:limit]]
+
+    def subscribe(self, agent_id: str, topic: str, subscribed: bool = True) -> bool:
+        """Enable or disable exact-topic delivery; return False for empty ids."""
+        agent_id = str(agent_id or "").strip()
+        topic = str(topic or "").strip()
+        if not agent_id or not topic:
+            return False
+        if subscribed:
+            self._subscriptions.setdefault(agent_id, set()).add(topic)
+        else:
+            topics = self._subscriptions.get(agent_id)
+            if topics is not None:
+                topics.discard(topic)
+                if not topics:
+                    del self._subscriptions[agent_id]
+        return True
+
+    def subscriptions(self, agent_id: str) -> list[str]:
+        return sorted(self._subscriptions.get(str(agent_id), ()))
+
+    def pending(self, agent_id: str | None = None, *, now: float | None = None) -> list[dict]:
+        """Unclosed question/help roots, with their owner and derived deadline state."""
+        now = time.time() if now is None else float(now)
+        if not math.isfinite(now):
+            raise ValueError("now must be finite")
+        out = []
+        for m in sorted(self._messages.values(), key=lambda m: m.id):
+            if m.reply_to or m.closed or m.msg_type not in ("question", "help"):
+                continue
+            owner = m.to or "master"
+            if agent_id is not None and owner != agent_id:
+                continue
+            item = m.to_dict()
+            item["owner"] = owner
+            item["overdue"] = m.ttl > 0 and now >= m.created_at + m.ttl
+            out.append(item)
+        return out
 
     def roster(self) -> list[str]:
         """Distinct agent ids that have posted, most-recent first."""
@@ -384,7 +454,7 @@ class Forum:
         limit = max(int(limit or 10), 1)
         msgs = [
             m for m in self._messages.values()
-            if m.to == agent_id or self._is_broadcast(m)
+            if self._addresses(m, agent_id)
         ]
         msgs.sort(key=lambda m: m.id)
         items = [
@@ -420,7 +490,7 @@ class Forum:
         candidate/hypothesis/raw items."""
         visible = [
             m for m in self._messages.values()
-            if m.pinned or self._is_broadcast(m) or m.to == agent_id
+            if m.pinned or self._addresses(m, agent_id)
         ]
         visible.sort(key=lambda m: (not (m.pinned or m.announcement), m.id))
         lines = ["【论坛 — 你可见的消息（未标注 verified 的项均视为未验证）】"]
@@ -447,6 +517,9 @@ class Forum:
             "next_id": self._next_id,
             "max_pinned": self.max_pinned,
             "max_messages": self.max_messages,
+            "subscriptions": {
+                agent: sorted(topics) for agent, topics in sorted(self._subscriptions.items())
+            },
             "messages": [
                 m.to_dict()
                 for m in sorted(self._messages.values(), key=lambda m: m.id)
@@ -470,6 +543,10 @@ class Forum:
             m = Message.from_dict(raw)
             f._messages[m.id] = m
             f._next_id = max(f._next_id, m.id + 1)
+        for agent, topics in (data.get("subscriptions") or {}).items():
+            if isinstance(topics, list):
+                for topic in topics:
+                    f.subscribe(agent, topic)
         return f
 
     # ---------------------------------------------------------- bounded size

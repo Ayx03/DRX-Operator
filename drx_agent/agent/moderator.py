@@ -20,6 +20,8 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from drx_agent.agent.consensus import verification_outcome
+
 # 验证队列积压阈值：超过则建议排空验证队列。
 _VERIFIER_BACKLOG_THRESHOLD = 3
 # 预算告警阈值（占用量比例）。
@@ -97,12 +99,14 @@ class Moderator:
         coverage=None,
         quorum: float = 0.0,
         budget_used_ratio: float = 0.0,
+        workers=None,
+        now: float | None = None,
     ) -> ModeratorMetrics:
         """Derive a ``ModeratorMetrics`` from whatever objects are passed.
 
-        Any object may be None; unknown/absent attributes are skipped via
-        ``getattr``. Metrics that have no source here (``stalled_workers``,
-        ``conflicts``) default to 0 and are supplied by callers that own them.
+        Workers are the actual runtime objects, never a historical forum roster
+        or claim-owner count. Verification conflicts come from structured verdicts,
+        not conversational text. ``now`` makes stall detection deterministic.
         """
         open_intents = 0
         claimed_intents = 0
@@ -129,48 +133,36 @@ class Moderator:
         # Unassigned = open intents not yet claimed (frontier OPEN == unclaimed).
         unassigned_intents = open_intents
 
-        # Pending verifications = findings still "suspected" (await verification).
         pending_verifications = 0
+        conflicts = 0
         if knowledge_base is not None:
-            all_findings = getattr(knowledge_base, "all_findings", None)
-            if callable(all_findings):
-                try:
-                    for _host, finding in all_findings():
-                        if str(getattr(finding, "status", "") or "") == "suspected":
-                            pending_verifications += 1
-                except Exception:
-                    pending_verifications = 0
+            for _host, finding in knowledge_base.all_findings():
+                verdict, conflict = verification_outcome(finding)
+                if getattr(finding, "status", "") == "suspected" or verdict not in ("confirmed", "rejected"):
+                    pending_verifications += 1
+                conflicts += int(conflict)
 
-        # Active workers: prefer forum roster size, else distinct claim owners.
         active_workers = 0
-        if forum is not None:
-            roster = getattr(forum, "roster", None)
-            if callable(roster):
-                try:
-                    r = roster() or []
-                    if isinstance(r, (dict, list, tuple, set)):
-                        active_workers = len(r)
-                except Exception:
-                    active_workers = 0
-        if active_workers == 0 and claims is not None:
-            active = getattr(claims, "active", None)
-            if callable(active):
-                try:
-                    owners: set[str] = set()
-                    for it in active() or []:
-                        if isinstance(it, dict):
-                            o = it.get("owner") or it.get("agent_id") or it.get("worker")
-                        else:
-                            o = (
-                                getattr(it, "owner", None)
-                                or getattr(it, "agent_id", None)
-                                or getattr(it, "worker", None)
-                            )
-                        if o:
-                            owners.add(str(o))
-                    active_workers = len(owners)
-                except Exception:
-                    active_workers = 0
+        stalled_workers = 0
+        now = time.time() if now is None else now
+        for worker in (workers or {}).values():
+            raw_status = getattr(worker, "status", "")
+            status = getattr(raw_status, "value", raw_status)
+            if status not in ("queued", "running"):
+                continue
+            active_workers += 1
+            if status != "running":
+                continue
+            started_at = getattr(worker, "started_at", None)
+            last_activity_at = getattr(worker, "last_activity_at", None)
+            ttl = getattr(worker, "ttl", 0) or 0
+            idle_limit = max(60.0, float(getattr(worker, "llm_call_timeout", 0) or 0))
+            if (
+                started_at is not None and ttl > 0 and now - started_at > ttl
+            ) or (
+                last_activity_at is not None and now - last_activity_at > idle_limit
+            ):
+                stalled_workers += 1
 
         coverage = dict(coverage or {})
 
@@ -179,13 +171,13 @@ class Moderator:
             claimed_intents=claimed_intents,
             unassigned_intents=unassigned_intents,
             active_workers=active_workers,
-            stalled_workers=0,
+            stalled_workers=stalled_workers,
             duplicate_intent_pairs=Moderator._count_duplicate_pairs(hypotheses),
             pending_verifications=pending_verifications,
             coverage=coverage,
             quorum=float(quorum or 0.0),
             budget_used_ratio=float(budget_used_ratio or 0.0),
-            conflicts=0,
+            conflicts=conflicts,
         )
 
     @staticmethod

@@ -377,7 +377,7 @@ class DrxAgent:
                     data={"message": f"Save failed: {e}"}
                 ))
 
-        def handle_restore(event: Event):
+        async def handle_restore(event: Event):
             try:
                 sessions = self.session_manager.list_sessions()
                 if not sessions:
@@ -387,51 +387,55 @@ class DrxAgent:
                     ))
                     return
                 latest = sessions[0]
-                restored = self.session_manager.restore(latest["id"])
-                if not restored:
-                    self.event_bus.publish(Event(
-                        type=EventType.ERROR,
-                        data={"message": "Restore returned no data"}
-                    ))
-                    return
-                self.knowledge_base = restored["kb"]
-                self.master.knowledge_base = restored["kb"]
-                self.master.messages = restored.get("messages", [])
-                self.master.todos = restored.get("todos", [])
-                self.master.frontier = Frontier.from_dict(
-                    restored.get("frontier") or {}
-                )
-                self.master.frontier.rebase_budgets()
-                raw_handoff = restored.get("handoff") or {}
-                self.master.handoff = (
-                    Handoff.from_dict(raw_handoff) if raw_handoff else None
-                )
-                self.master.stage_machine = StageMachine.from_dict(
-                    restored.get("stage") or {}
-                )
-                from drx_agent.agent.forum import Forum
-                from drx_agent.agent.claims import ClaimRegistry
-                from drx_agent.agent.moderator import Moderator
-                from drx_agent.agent.irc import IRC
-                from drx_agent.agent.project_note import ProjectNote
-                self.master.forum = Forum.from_dict(restored.get("forum") or {})
-                self.master.claims = ClaimRegistry.from_dict(restored.get("claims") or {})
-                self.master.moderator = Moderator.from_dict(restored.get("moderator") or {})
-                self.master.irc = IRC.from_dict(restored.get("irc") or {})
-                self.master.project_note = ProjectNote.from_dict(
-                    restored.get("project_note") or {}
-                )
-                self.master.mode = restored.get("mode", "act") or "act"
-                if restored.get("session_usage"):
-                    self.master.session_usage.update(restored["session_usage"])
-                if self.master.todos:
-                    self.event_bus.publish(Event(
-                        type=EventType.STATUS_UPDATE,
-                        data={"tasks": [
-                            {"name": t.get("content", ""), "status": t.get("status", "pending"), "id": t.get("id", "")}
-                            for t in self.master.todos
-                        ]},
-                    ))
+                await self.master.prepare_restore()
+                try:
+                    restored = self.session_manager.restore(latest["id"])
+                    if restored is None:
+                        raise ValueError("Restore returned no data")
+
+                    # Construct the complete replacement before changing live state.
+                    # No await is allowed between preparation and finish_restore.
+                    from drx_agent.agent.forum import Forum
+                    from drx_agent.agent.claims import ClaimRegistry
+                    from drx_agent.agent.moderator import Moderator
+                    from drx_agent.agent.irc import IRC
+                    from drx_agent.agent.project_note import ProjectNote
+
+                    frontier = Frontier.from_dict(restored["frontier"])
+                    frontier.reconcile_restored()
+                    raw_handoff = restored["handoff"]
+                    handoff = Handoff.from_dict(raw_handoff) if raw_handoff else None
+                    stage = StageMachine.from_dict(restored["stage"])
+                    forum = Forum.from_dict(restored["forum"])
+                    claims = ClaimRegistry.from_dict(restored["claims"])
+                    moderator = Moderator.from_dict(restored["moderator"])
+                    irc = IRC.from_dict(restored["irc"])
+                    project_note = ProjectNote.from_dict(restored["project_note"])
+
+                    self.knowledge_base = restored["kb"]
+                    self.master.knowledge_base = restored["kb"]
+                    self.master.messages = restored["messages"]
+                    self.master.todos = restored["todos"]
+                    self.master.frontier = frontier
+                    self.master.handoff = handoff
+                    self.master.stage_machine = stage
+                    self.master.forum = forum
+                    self.master.claims = claims
+                    self.master.moderator = moderator
+                    self.master.irc = irc
+                    self.master.project_note = project_note
+                    self.master.mode = restored["mode"]
+                    self.master.session_usage = restored["session_usage"]
+                finally:
+                    self.master.finish_restore()
+
+                self.event_bus.publish(Event(
+                    type=EventType.STATUS_UPDATE,
+                    data={"tasks": [
+                        {"name": t.get("content", ""), "status": t.get("status", "pending"), "id": t.get("id", "")}
+                        for t in self.master.todos
+                    ]},
+                ))
                 self.event_bus.publish(Event(
                     type=EventType.STATUS_UPDATE,
                     data={
@@ -443,7 +447,7 @@ class DrxAgent:
                     type=EventType.AGENT_MESSAGE,
                     data={
                         "text": (
-                            f"♻️ 会话已恢复: {latest['name']} "
+                            f"会话已恢复: {latest['name']} "
                             f"(messages={len(self.master.messages)}, "
                             f"targets={len(self.knowledge_base.list_targets())}, "
                             f"creds={len(self.knowledge_base.list_credentials())}, "
@@ -459,7 +463,10 @@ class DrxAgent:
                 ))
 
         self.event_bus.subscribe(EventType.SESSION_SAVE, handle_save)
-        self.event_bus.subscribe(EventType.SESSION_RESTORE, handle_restore)
+        self.event_bus.subscribe(
+            EventType.SESSION_RESTORE,
+            lambda event: self.master._schedule(handle_restore(event)),
+        )
 
 
 def main():

@@ -16,6 +16,7 @@ Self-contained: imports only stdlib.
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -71,7 +72,18 @@ class ClaimRegistry:
 
     @staticmethod
     def _now(now: float | None) -> float:
-        return time.time() if now is None else float(now)
+        value = time.time() if now is None else float(now)
+        if not math.isfinite(value):
+            raise ValueError("now must be finite")
+        return value
+
+    @staticmethod
+    def _deadline(now: float, ttl: float) -> float:
+        ttl = float(ttl)
+        deadline = now + ttl
+        if not math.isfinite(ttl) or ttl <= 0 or not math.isfinite(deadline) or deadline <= now:
+            raise ValueError("ttl must produce a finite future lease deadline")
+        return deadline
 
     def _active_claim(self, work_item: str, now: float) -> Claim | None:
         for c in self._claims.values():
@@ -91,14 +103,16 @@ class ClaimRegistry:
         if the item is actively claimed by someone else. Expired leases are
         reclaimed first; re-acquiring your own item refreshes the lease."""
         now = self._now(now)
-        work_item = str(work_item)
-        owner = str(owner)
-        ttl = float(ttl or 600.0)
+        if not isinstance(work_item, str) or not work_item.strip():
+            raise ValueError("work_item must be nonempty")
+        if not isinstance(owner, str) or not owner.strip():
+            raise ValueError("owner must be nonempty")
+        deadline = self._deadline(now, ttl)
         self.expire(now=now)  # reclaim stale leases first
         existing = self._active_claim(work_item, now)
         if existing is not None:
             if existing.owner == owner:
-                existing.lease_until = now + ttl
+                existing.lease_until = deadline
                 existing.heartbeat = now
                 existing.status = ACTIVE
                 return existing.claim_id
@@ -108,7 +122,7 @@ class ClaimRegistry:
             claim_id=claim_id,
             work_item=work_item,
             owner=owner,
-            lease_until=now + ttl,
+            lease_until=deadline,
             heartbeat=now,
             status=ACTIVE,
             created_at=now,
@@ -121,24 +135,38 @@ class ClaimRegistry:
         *,
         ttl: float = 600.0,
         now: float | None = None,
+        owner: str | None = None,
     ) -> bool:
         """Extend an active lease. Returns False when the claim is unknown,
         already released/expired, or past its deadline."""
         now = self._now(now)
+        deadline = self._deadline(now, ttl)
         claim = self._claims.get(claim_id)
-        if claim is None or claim.status != ACTIVE or claim.lease_until <= now:
+        if (
+            claim is None or claim.status != ACTIVE or claim.lease_until <= now
+            or (owner is not None and claim.owner != owner)
+        ):
             return False
-        claim.lease_until = now + float(ttl or 600.0)
+        claim.lease_until = deadline
         claim.heartbeat = now
         return True
 
-    def release(self, claim_id: str) -> bool:
-        """Free an active claim so another worker may take the item."""
+    def release(self, claim_id: str, *, owner: str | None = None) -> bool:
+        """Free an active claim, checking its owner when supplied."""
         claim = self._claims.get(claim_id)
-        if claim is None or claim.status != ACTIVE:
+        if claim is None or claim.status != ACTIVE or (owner is not None and claim.owner != owner):
             return False
         claim.status = RELEASED
         return True
+
+    def release_owner(self, owner: str) -> int:
+        """Release every active lease held by an exiting worker."""
+        count = 0
+        for claim in self._claims.values():
+            if claim.status == ACTIVE and claim.owner == owner:
+                claim.status = RELEASED
+                count += 1
+        return count
 
     def is_taken(self, work_item: str, *, now: float | None = None) -> bool:
         now = self._now(now)
@@ -154,7 +182,9 @@ class ClaimRegistry:
         now = self._now(now)
         count = 0
         for claim in self._claims.values():
-            if claim.status == ACTIVE and claim.lease_until <= now:
+            if claim.status == ACTIVE and (
+                not math.isfinite(claim.lease_until) or claim.lease_until <= now
+            ):
                 claim.status = EXPIRED
                 count += 1
         return count

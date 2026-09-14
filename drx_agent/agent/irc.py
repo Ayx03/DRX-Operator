@@ -109,10 +109,6 @@ class IRC:
         for m in droppable[:overflow]:
             del self._messages[m.id]
 
-    def _excerpt(self, m: IRCMessage) -> dict:
-        d = m.to_dict()
-        d["content"] = m.content[: self.excerpt_chars]
-        return d
 
     # ----------------------------------------------------------------- send
 
@@ -145,6 +141,7 @@ class IRC:
             if (
                 target is None
                 or target.to_agent != from_agent
+                or target.from_agent != to_agent
                 or target.status != IRCStatus.OPEN
             ):
                 return None
@@ -166,15 +163,19 @@ class IRC:
 
     # ----------------------------------------------------------------- read
 
-    def inbox(self, agent, *, unread_only=False, limit=20) -> list[dict]:
-        """Messages addressed to ``agent``, newest last, with bounded content."""
+    def inbox(self, agent, *, unread_only=False, after_id=0, limit=20) -> list[dict]:
+        """Earliest page after ``after_id``, in id order, with complete content."""
         limit = max(int(limit or 20), 1)
         agent = str(agent)
-        msgs = [m for m in self._messages.values() if m.to_agent == agent]
+        after_id = int(after_id or 0)
+        msgs = [
+            m for m in self._messages.values()
+            if m.to_agent == agent and m.id > after_id
+        ]
         if unread_only:
             msgs = [m for m in msgs if not m.read]
         msgs.sort(key=lambda m: m.id)
-        return [self._excerpt(m) for m in msgs[-limit:]]
+        return [m.to_dict() for m in msgs[:limit]]
 
     def pending_for(self, agent, *, limit=20) -> list[dict]:
         """OPEN messages addressed to ``agent`` that it still owes an answer to."""
@@ -185,7 +186,7 @@ class IRC:
             if m.to_agent == agent and m.status == IRCStatus.OPEN
         ]
         msgs.sort(key=lambda m: m.id)
-        return [m.to_dict() for m in msgs[-limit:]]
+        return [m.to_dict() for m in msgs[:limit]]
 
     def reply(self, agent, message_id, content, *, now=None) -> int | None:
         """Answer a message sent TO ``agent``. The "only the original recipient
@@ -198,15 +199,16 @@ class IRC:
 
     # ------------------------------------------------------------- read state
 
-    def mark_read(self, agent, *, up_to_id=0) -> int:
-        """Mark messages addressed to ``agent`` with id <= ``up_to_id`` (or all
-        when ``up_to_id`` is 0) as read; return the number newly marked."""
+    def mark_read(self, agent, *, up_to_id=0, message_ids=None) -> int:
+        """Mark only delivered ``message_ids`` when supplied; otherwise mark
+        through ``up_to_id`` (0 means all). Return the number newly marked."""
         agent = str(agent)
         up_to_id = int(up_to_id or 0)
+        delivered = None if message_ids is None else {int(mid) for mid in message_ids}
         count = 0
         for m in self._messages.values():
             if m.to_agent == agent and not m.read:
-                if up_to_id == 0 or m.id <= up_to_id:
+                if (m.id in delivered if delivered is not None else up_to_id == 0 or m.id <= up_to_id):
                     m.read = True
                     count += 1
         return count
@@ -226,6 +228,22 @@ class IRC:
             return False
         m.status = IRCStatus.CLOSED.value
         m.closed_reason = (reason or "")[:CLOSE_REASON_CHARS]
+        return True
+
+    def admin_close(self, message_id, *, actor, reason) -> bool:
+        """Retire an orphaned obligation without impersonating either participant.
+
+        The runtime checks that neither participant is still active. The
+        original message remains available with an explicit supervisory audit.
+        """
+        reason = str(reason or "").strip()
+        if actor != "master" or not reason:
+            return False
+        message = self._messages.get(int(message_id or 0))
+        if message is None or message.status != IRCStatus.OPEN:
+            return False
+        message.status = IRCStatus.CLOSED.value
+        message.closed_reason = f"Administrative close by master: {reason}"[:CLOSE_REASON_CHARS]
         return True
 
     # ----------------------------------------------------------------- render

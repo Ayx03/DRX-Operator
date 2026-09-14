@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
+from drx_agent.agent.consensus import verification_outcome
+
 
 class Stage(str, Enum):
     RECON = "recon"
@@ -40,10 +42,11 @@ ALWAYS_ALLOWED: frozenset[str] = frozenset(
     {
         "todo_write", "blackboard_read", "blackboard_write", "stage_advance",
         "forum_post", "forum_read", "forum_threads", "forum_digest",
-        "forum_pin", "forum_close", "forum_wait",
+        "forum_pin", "forum_close", "forum_wait", "forum_subscribe", "forum_pending",
         "claim_acquire", "claim_release", "claim_status",
         "team_status", "request_close",
         "irc_send", "irc_inbox", "irc_reply", "irc_pending", "irc_close",
+        "irc_admin_close",
         "note_update", "note_read", "note_clear",
     }
 )
@@ -230,14 +233,32 @@ class StageMachine:
         return self.stage
 
     @staticmethod
-    def _has_verified(knowledge_base, handoff) -> bool:
-        for _host, finding in knowledge_base.all_findings():
-            if getattr(finding, "status", "") in ("confirmed", "exploited"):
-                return True
-        for item in (handoff.candidates if handoff is not None else []) or []:
-            if getattr(item, "status", "") == "verified":
-                return True
-        return False
+    def _verification_complete(knowledge_base, handoff, frontier) -> bool:
+        findings = knowledge_base.all_findings()
+        for _host, finding in findings:
+            verdict, conflict = verification_outcome(finding)
+            if (
+                getattr(finding, "status", "") == "suspected"
+                or verdict not in ("confirmed", "rejected")
+                or conflict
+            ):
+                return False
+        candidates = (handoff.candidates if handoff is not None else []) or []
+        for item in candidates:
+            status = getattr(item, "status", "")
+            if status == "rejected":
+                continue
+            if status != "verified" or not getattr(item, "evidence", None):
+                return False
+        if findings or candidates:
+            return True
+        # No candidates is a valid result only when an actual plan completed.
+        # An empty KB/frontier alone does not establish coverage.
+        intents = getattr(frontier, "_intents", None) or {}
+        return bool(intents) and all(
+            getattr(getattr(intent, "status", ""), "value", getattr(intent, "status", "")) == "done"
+            for intent in intents.values()
+        )
 
     def gate(self, handoff, frontier, knowledge_base) -> tuple[bool, str]:
         """Program-level gate: decides whether advancing from the CURRENT stage
@@ -270,10 +291,10 @@ class StageMachine:
                     "RESEARCH 无候选/假设（candidates/hypotheses 均空），不可进入 VERIFY",
                 )
         if current is Stage.VERIFY:
-            if not self._has_verified(knowledge_base, handoff):
+            if not self._verification_complete(knowledge_base, handoff, frontier):
                 return (
                     False,
-                    "VERIFY 无已验证发现（confirmed/exploited 或候选 status=verified），不可进入 SYNTHESIS",
+                    "VERIFY 仍有未终局验证的候选，或缺少已完成计划，不可进入 SYNTHESIS",
                 )
         return True, ""
 

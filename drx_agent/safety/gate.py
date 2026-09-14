@@ -2,8 +2,8 @@
 
 Risk levels escalate from L0 (fully auto-approved reconnaissance) through
 L4 (destructive operations requiring a confirmation phrase).  The gate
-remembers session-level approvals so the user does not have to re-approve
-the same operation-target pair within a session.
+remembers approvals only for the same operation, target and risk level.
+L4 always requires a fresh confirmation, including after another L4 approval.
 """
 
 from dataclasses import dataclass
@@ -44,7 +44,7 @@ class SafetyGate:
     """Gate that checks whether an operation should be allowed to proceed.
 
     L0  — always auto-approved.
-    L1  — auto-approved *per session* (target+op remembered).
+    L1  — auto-approved, without authorizing higher-risk operations.
     L2  — requires user approve() for the specific request.
     L3  — requires user approve() for the specific request.
     L4  — requires a confirmation phrase (destroy-action-phrase).
@@ -52,18 +52,18 @@ class SafetyGate:
 
     def __init__(self) -> None:
         self._pending: dict[str, ApprovalRequest] = {}
-        self._session_approvals: set[str] = set()
+        self._session_approvals: set[tuple[str, RiskLevel, str]] = set()
 
     def check(self, operation: str, risk_level: RiskLevel, target: str) -> CheckResult:
-        
-        session_key = f"{operation}:{target}"
-        if session_key in self._session_approvals:
+        risk_level = RiskLevel(risk_level)
+        if risk_level in (RiskLevel.L0, RiskLevel.L1):
             return CheckResult(approved=True)
 
-        if risk_level == RiskLevel.L0:
+        session_key = (operation, risk_level, target)
+        if risk_level != RiskLevel.L4 and session_key in self._session_approvals:
             return CheckResult(approved=True)
 
-        req_id = str(uuid.uuid4())[:8]
+        req_id = uuid.uuid4().hex
         req = ApprovalRequest(
             request_id=req_id,
             operation=operation,
@@ -73,11 +73,6 @@ class SafetyGate:
             requires_approval=risk_level in (RiskLevel.L2, RiskLevel.L3),
             requires_confirmation_phrase=(risk_level == RiskLevel.L4),
         )
-
-        if risk_level == RiskLevel.L1:
-            req.approved = True
-            self._session_approvals.add(session_key)
-            return CheckResult(approved=True)
 
         self._pending[req_id] = req
         return CheckResult(
@@ -93,7 +88,7 @@ class SafetyGate:
             req = self._pending[request_id]
             req.approved = True
             if req.risk_level != RiskLevel.L4:
-                self._session_approvals.add(f"{req.operation}:{req.target}")
+                self._session_approvals.add((req.operation, req.risk_level, req.target))
             del self._pending[request_id]
             return True
         return False
@@ -101,6 +96,11 @@ class SafetyGate:
     def deny(self, request_id: str) -> None:
         
         self._pending.pop(request_id, None)
+
+    def reset_session(self) -> None:
+        """Drop pending requests and grants when changing sessions."""
+        self._pending.clear()
+        self._session_approvals.clear()
 
     def get_pending(self) -> list[ApprovalRequest]:
         
