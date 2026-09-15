@@ -14,6 +14,7 @@ from drx_agent.llm.base import (
     LLMProvider,
 )
 from drx_agent.llm.deepseek_provider import _extract_usage
+from drx_agent.llm.output_tokens import resolve_output_token_params
 
 
 class OpenAIProvider(LLMProvider):
@@ -39,8 +40,9 @@ class OpenAIProvider(LLMProvider):
                 "temperature": self.config.temperature,
                 "messages": messages,
             }
-            if self.config.max_tokens is not None:
-                kwargs["max_tokens"] = self.config.max_tokens
+            kwargs.update(resolve_output_token_params(
+                self.config, api="chat", base_url=str(self.client.base_url),
+            ))
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"

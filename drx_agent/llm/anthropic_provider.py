@@ -13,6 +13,7 @@ from drx_agent.llm.base import (
     LLMError,
     LLMProvider,
 )
+from drx_agent.llm.output_tokens import resolve_output_token_params
 
 
 def _to_anthropic_tools(openai_tools):
@@ -176,17 +177,14 @@ class AnthropicProvider(LLMProvider):
 
     async def chat(self, messages, tools=None, stream=True):
         try:
-            if self.config.max_tokens is None:
-                raise LLMError(
-                    "Anthropic Messages requires max_tokens; configure llm.max_tokens "
-                    "explicitly for this provider."
-                )
             system, anthropic_messages = _to_anthropic_messages(messages)
             anthropic_tools = _to_anthropic_tools(tools) if tools else None
 
             kwargs = {
                 "model": self.config.model,
-                "max_tokens": self.config.max_tokens,
+                **resolve_output_token_params(
+                    self.config, api="anthropic", base_url=str(self.client.base_url),
+                ),
                 "temperature": self.config.temperature,
                 "messages": anthropic_messages,
             }

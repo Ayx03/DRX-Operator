@@ -128,9 +128,14 @@ Edit the `llm` section in `configs/default_config.json`. Only modify non-sensiti
 }
 ```
 
-OpenAI-compatible and EXO requests have no client-side output-token cap by default. Omit `llm.max_tokens` or set it to `null` to leave that parameter out of the request; an explicit numeric value still sets a cap. Server defaults and model limits continue to apply. `context_window` controls context management, not output length.
+Output budgets use model capabilities and endpoint policy, not a universal 4096-token default. Omit `llm.max_tokens` or set it to `null` to select the model default; an explicit number requests a cap, still bounded by the model and endpoint. Unknown manually configured models use a 16384-token output capability. Set `llm.model_max_tokens` to declare a custom model's actual output capability; `context_window` remains a separate context-management setting.
 
-The native [Anthropic Messages API](https://platform.claude.com/docs/en/api/messages/create) requires `max_tokens`. Set `llm.max_tokens` explicitly when using that provider; omission produces a configuration error rather than silently imposing 4096.
+- Chat Completions and Responses normally clamp output to 64000 tokens or the model's smaller limit. Native DeepSeek Flash, Moonshot Kimi K3 and selected GLM endpoints use their declared model caps instead. The default `deepseek-v4-pro` configuration sends **`max_tokens: 64000`**.
+- OpenRouter omits automatic catalog caps to avoid excluding upstreams; explicit caps are retained, and Kimi models still receive required caps.
+- Native Anthropic Messages automatically receives its required `max_tokens`, using the model capability rather than requiring a separate setting. API-key requests are not subject to the OAuth-only 64000-token ceiling.
+- Responses requests targeting the Codex endpoint omit output caps. This does not add a Codex login or transport implementation.
+
+For custom gateways, `llm.max_tokens_field` can select `max_tokens` or `max_completion_tokens` for Chat Completions; Responses uses `max_output_tokens`. `llm.always_send_max_tokens` overrides required-cap detection, and `llm.clamp_output_to_model_max` selects the model ceiling instead of the normal 64000 ceiling. `llm.omit_max_output_tokens: true` suppresses optional output fields even when a cap was explicitly set; it does not suppress Anthropic's required field. Model-serving limits and server defaults still apply.
 
 Supported Provider types:
 

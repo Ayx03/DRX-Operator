@@ -145,9 +145,14 @@ set -a && source .env && set +a
 }
 ```
 
-OpenAI 兼容接口和 EXO 默认不再附加客户端输出 token 上限。删除 `llm.max_tokens` 或设为 `null` 都会省略请求中的对应参数；显式填写数值仍可设置上限。服务端默认值和模型自身限制依然存在；`context_window` 用于上下文管理，不是输出长度限制。
+输出预算按模型能力和接口策略确定，不再统一设为 4096。删除 `llm.max_tokens` 或设为 `null` 会使用模型默认值；显式填写数值仍受模型与接口上限约束。手动配置的未知模型默认输出能力为 16384，可用 `llm.model_max_tokens` 声明其实际输出能力；`context_window` 仍是独立的上下文管理设置。
 
-原生 [Anthropic Messages 接口](https://platform.claude.com/docs/en/api/messages/create)要求必填 `max_tokens`。使用该 Provider 时需显式设置 `llm.max_tokens`；未设置会报告配置错误，不会偷偷回退到 4096。
+- Chat Completions 与 Responses 通常将输出裁到 64000 或模型更小的上限。原生 DeepSeek Flash、Moonshot Kimi K3 和部分 GLM 接口使用各自声明的模型上限。当前默认的 `deepseek-v4-pro` 实际发送 **`max_tokens: 64000`**。
+- OpenRouter 省略自动采用的模型目录上限，避免排除可用上游；保留显式上限，Kimi 模型仍发送接口需要的上限。
+- 原生 Anthropic Messages 自动补齐必填的 `max_tokens`，按模型能力处理，无需额外填写。API Key 请求不套用 OAuth 专属的 64000 上限。
+- 指向 Codex 端点的 Responses 请求省略输出上限；这不代表新增了 Codex 登录或专用传输实现。
+
+自定义网关可用 `llm.max_tokens_field` 为 Chat Completions 指定 `max_tokens` 或 `max_completion_tokens`；Responses 固定使用 `max_output_tokens`。`llm.always_send_max_tokens` 可覆盖必填上限识别，`llm.clamp_output_to_model_max` 可改用模型上限而非通常的 64000 上限。设置 `llm.omit_max_output_tokens: true` 会省略可选输出字段，即使已显式填写上限；Anthropic 的必填字段不受此开关影响。服务端默认值和模型自身限制依然有效。
 
 支持的 Provider 类型：
 

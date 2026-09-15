@@ -10,6 +10,7 @@ from drx_agent.llm.base import (
     LLMError,
     LLMProvider,
 )
+from drx_agent.llm.output_tokens import resolve_output_token_params
 
 
 def _extract_usage(usage_obj):
@@ -64,8 +65,9 @@ class DeepSeekProvider(LLMProvider):
                 "temperature": self.config.temperature,
                 "messages": messages,
             }
-            if self.config.max_tokens is not None:
-                kwargs["max_tokens"] = self.config.max_tokens
+            kwargs.update(resolve_output_token_params(
+                self.config, api="chat", base_url=str(self.client.base_url),
+            ))
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"

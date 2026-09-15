@@ -24,12 +24,19 @@ class LLMConfig:
     api_key: str = ""
     base_url: str = ""
     temperature: float = 0.7
-    # None omits optional output limits; APIs requiring a limit need an explicit value.
+    # None selects the model/endpoint default; a number requests an explicit cap.
     max_tokens: int | None = None
     # Which OpenAI-style API the model endpoint speaks: "chat" (chat/completions)
     # or "responses" (v1/responses). Providers that only speak one interface
     # ignore this; it exists for routing where both are possible.
     api_interface: str = "chat"
+    # Output capability is separate from the context window and the requested cap.
+    model_max_tokens: int | None = None
+    omit_max_output_tokens: bool = False
+    max_tokens_field: str | None = None
+    always_send_max_tokens: bool | None = None
+    clamp_output_to_model_max: bool | None = None
+    provider: str = ""
 
 class LLMProvider(ABC):
     @abstractmethod

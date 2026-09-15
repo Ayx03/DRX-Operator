@@ -30,6 +30,7 @@ from drx_agent.agent.frontier import Frontier
 from drx_agent.agent.handoff import Handoff
 from drx_agent.agent.stage import StageMachine
 from drx_agent.llm.base import LLMConfig
+from drx_agent.llm.output_tokens import CUSTOM_MODEL_MAX_OUTPUT_TOKENS, model_output_limit
 from drx_agent.mcp.manager import MCPManager
 from drx_agent.hooks.manager import HookManager
 
@@ -66,14 +67,27 @@ def _build_one_provider(spec: dict):
     if api_interface not in ("chat", "responses"):
         api_interface = "chat"
 
+    model = os.environ.get("DRX_LLM_MODEL") or spec.get("model", "deepseek-chat")
+    base_url = os.environ.get("DRX_LLM_BASE_URL") or spec.get("base_url", "")
     max_tokens = spec.get("max_tokens")
+    model_max_tokens = spec.get("model_max_tokens")
+    if model_max_tokens is None:
+        model_max_tokens = model_output_limit(model, provider_name, base_url)
+    if model_max_tokens is None:
+        model_max_tokens = CUSTOM_MODEL_MAX_OUTPUT_TOKENS
     config = LLMConfig(
-        model=os.environ.get("DRX_LLM_MODEL") or spec.get("model", "deepseek-chat"),
+        model=model,
         api_key=api_key,
-        base_url=os.environ.get("DRX_LLM_BASE_URL") or spec.get("base_url", ""),
+        base_url=base_url,
         temperature=float(spec.get("temperature", 0.7)),
         max_tokens=int(max_tokens) if max_tokens is not None else None,
         api_interface=api_interface,
+        model_max_tokens=int(model_max_tokens) if model_max_tokens is not None else None,
+        omit_max_output_tokens=spec.get("omit_max_output_tokens", False),
+        max_tokens_field=spec.get("max_tokens_field"),
+        always_send_max_tokens=spec.get("always_send_max_tokens"),
+        clamp_output_to_model_max=spec.get("clamp_output_to_model_max"),
+        provider=provider_name,
     )
     try:
         if provider_name in ("anthropic", "claude"):

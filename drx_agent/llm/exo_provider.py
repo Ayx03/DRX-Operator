@@ -37,6 +37,7 @@ from drx_agent.llm.exo_conversions import (
     _sse_event_to_tuple,
     _tool_to_responses,
 )
+from drx_agent.llm.output_tokens import resolve_output_token_params
 
 
 @dataclass
@@ -117,8 +118,9 @@ class EXOProvider(LLMProvider):
                 "input": input_items if input_items else "",
                 "temperature": self.config.temperature,
             }
-            if self.config.max_tokens is not None:
-                kwargs["max_output_tokens"] = self.config.max_tokens
+            kwargs.update(resolve_output_token_params(
+                self.config, api="responses", base_url=str(self.client.base_url),
+            ))
             if instructions:
                 kwargs["instructions"] = instructions
             if tools:
