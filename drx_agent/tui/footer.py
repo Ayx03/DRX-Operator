@@ -71,6 +71,7 @@ class StatusFooter(Static):
             "active_targets": None,
             "requests": None,
             "mode": "act",
+            "model": None,
             "text": "",
         }
         self._pending_lock = threading.Lock()
@@ -145,6 +146,8 @@ class StatusFooter(Static):
             text.append(separator, style=self.get_component_rich_style("status-divider"))
             text.append(field, style=self.get_component_rich_style("status-text"))
         extras = []
+        if state["model"]:
+            extras.append(f"model: {str(state['model']).replace(chr(10), ' ').replace(chr(13), ' ')}")
         coverage = cache_text(
             _number(state["cache_hits"]), _number(state["cache_known_input_tokens"]),
             _number(state["cache_unknown_input_tokens"]), _number(state["cache_unknown_requests"]),

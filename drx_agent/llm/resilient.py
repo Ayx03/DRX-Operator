@@ -61,12 +61,17 @@ class ResilientProvider(LLMProvider):
             except Exception:
                 pass
 
-    async def chat(self, messages, tools=None, stream=True):
+    def chat(self, messages, tools=None, stream=True):
+        # Capture at call time, before the async iterator starts. A model change
+        # must not alter this request's retries or fallback providers.
+        return self._chat(tuple(self.providers), messages, tools, stream)
+
+    async def _chat(self, providers, messages, tools=None, stream=True):
         last_error_msg = "all providers failed"
         last_error_metadata: dict = {}
-        n_providers = len(self.providers)
+        n_providers = len(providers)
 
-        for p_idx, provider in enumerate(self.providers):
+        for p_idx, provider in enumerate(providers):
             label = f"{type(provider).__name__}/{getattr(provider.config, 'model', '?')}"
             for attempt in range(self.max_retries + 1):
                 yielded_content = False
@@ -128,7 +133,7 @@ class ResilientProvider(LLMProvider):
             if p_idx < n_providers - 1:
                 self._emit(
                     f"Failing over from {label} to "
-                    f"{type(self.providers[p_idx + 1]).__name__}"
+                    f"{type(providers[p_idx + 1]).__name__}"
                 )
 
         yield AgentEvent(

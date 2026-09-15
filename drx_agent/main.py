@@ -75,6 +75,7 @@ def _build_one_provider(spec: dict):
         model_max_tokens = model_output_limit(model, provider_name, base_url)
     if model_max_tokens is None:
         model_max_tokens = CUSTOM_MODEL_MAX_OUTPUT_TOKENS
+    context_window = spec.get("context_window")
     config = LLMConfig(
         model=model,
         api_key=api_key,
@@ -88,6 +89,7 @@ def _build_one_provider(spec: dict):
         always_send_max_tokens=spec.get("always_send_max_tokens"),
         clamp_output_to_model_max=spec.get("clamp_output_to_model_max"),
         provider=provider_name,
+        context_window=int(context_window) if context_window is not None else None,
     )
     try:
         if provider_name in ("anthropic", "claude"):
@@ -288,6 +290,9 @@ class DrxAgent:
         self.session_manager = SessionManager(storage_dir=os.path.abspath(session_dir))
 
         self.llm_provider = _build_llm_provider(event_bus=self.event_bus)
+        from drx_agent.llm.model_selection import ModelSelection
+        self.model_selection = ModelSelection(self.llm_provider) if self.llm_provider is not None else None
+        self._model_sequence = 0
 
         cfg_path = _config_path()
         self.mcp_manager = MCPManager.from_config_file(cfg_path)
@@ -328,6 +333,112 @@ class DrxAgent:
         self._load_skills()
 
         self._setup_session_handlers()
+        self.event_bus.subscribe(EventType.MODEL_REQUEST, self._on_model_request)
+
+    def _on_model_request(self, event: Event) -> None:
+        if self.master._closing or self.master._restoring:
+            return
+        self._model_sequence += 1
+        self.master._schedule(self._handle_model_request(dict(event.data), self._model_sequence))
+
+    def _publish_model_state(self, sequence: int, state: str, *, query: str = "",
+                             open_menu: bool = False, error: str = "") -> None:
+        selection = self.model_selection
+        self.event_bus.publish(Event(EventType.MODEL_STATE, {
+            "request_id": f"model-{sequence}", "sequence": sequence, "state": state,
+            "models": selection.snapshot() if selection is not None else [],
+            "current": selection.current_key if selection is not None else None,
+            "query": query, "open_menu": open_menu, "error": error,
+        }))
+
+    def _model_output(self, text: str) -> None:
+        self.event_bus.publish(Event(EventType.AGENT_MESSAGE, {"text": text, "source": "system"}))
+
+    def _apply_model_context(self, row: dict) -> None:
+        # A previous model's explicit window must not leak into the next model.
+        self.master.model_context_window_override = row.get("context_window") or 0
+        self.event_bus.publish(Event(EventType.STATUS_UPDATE, {"model": row["key"]}))
+
+    def _select_model(self, key: str, sequence: int) -> None:
+        row = self.model_selection.select(key)
+        self._apply_model_context(row)
+        self._publish_model_state(sequence, "selected")
+        self._model_output(
+            f"当前模型：{row['key']}。从下一次模型请求生效；正在返回的响应不受影响。"
+        )
+
+    async def _handle_model_request(self, data: dict, sequence: int) -> None:
+        action = data.get("action", "menu")
+        query = data.get("query", "")
+        if not isinstance(query, str):
+            query = ""
+        query = query.strip()
+        if sequence != self._model_sequence or self.master._closing or self.master._restoring:
+            return
+        if self.model_selection is None:
+            error = "没有可用的模型服务；请先配置 llm 和对应凭据。"
+            self._publish_model_state(sequence, "error", open_menu=action in ("menu", "refresh"), error=error)
+            self._model_output(error)
+            return
+        try:
+            selection = self.model_selection
+            if action == "current":
+                row = next(row for row in selection.snapshot() if row["key"] == selection.current_key)
+                window = row.get("context_window") or "自动"
+                capability = row.get("max_tokens") or "未知"
+                self._model_output(
+                    f"当前模型：{row['key']}\n服务：{row['endpoint']}\n"
+                    f"上下文窗口：{window}\n模型输出能力：{capability}（请求仍按接口策略裁剪）"
+                )
+                self._publish_model_state(sequence, "ready")
+                return
+            if action == "select":
+                key = data.get("key")
+                if isinstance(key, str) and key:
+                    self._select_model(key, sequence)
+                    return
+                matches = selection.match(query) if query else []
+                if len(matches) == 1 and query.casefold() in (
+                    matches[0]["key"].casefold(), matches[0]["model"].casefold(),
+                ):
+                    self._select_model(matches[0]["key"], sequence)
+                    return
+            if action not in ("menu", "refresh", "list", "select"):
+                raise ValueError("用法：/model、/model <模型>、/model list、/model current、/model refresh")
+            if action in ("menu", "refresh"):
+                self._publish_model_state(sequence, "loading", query=query, open_menu=True)
+            warnings = await selection.refresh()
+            if sequence != self._model_sequence or self.master._closing or self.master._restoring:
+                return
+            matches = selection.match(query) if query else selection.snapshot()
+            error = "\n".join(warnings)
+            if action == "list":
+                lines = [f"可用模型（当前：{selection.current_key}）："]
+                lines.extend(
+                    f"{'*' if row['key'] == selection.current_key else '-'} {row['key']}"
+                    f"  [{row['endpoint']}]"
+                    for row in matches
+                )
+                if not matches:
+                    lines.append("没有匹配的模型。")
+                if error:
+                    lines.append(error)
+                self._model_output("\n".join(lines))
+                self._publish_model_state(sequence, "ready")
+            elif action == "select" and len(matches) == 1:
+                self._select_model(matches[0]["key"], sequence)
+            else:
+                if action == "select" and not matches:
+                    error = "\n".join(filter(None, ("没有匹配的模型；可修改搜索词或使用 /model refresh。", error)))
+                self._publish_model_state(sequence, "ready", query=query, open_menu=True, error=error)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if sequence != self._model_sequence or self.master._closing or self.master._restoring:
+                return
+            error = str(exc) if isinstance(exc, ValueError) else f"模型操作失败（{type(exc).__name__}）。"
+            self._publish_model_state(sequence, "error", query=query, error=error)
+            self._model_output(error)
 
     async def async_setup(self) -> None:
         """One-time async startup: connect MCP servers, etc."""
@@ -362,7 +473,12 @@ class DrxAgent:
                 await asyncio.gather(setup, return_exceptions=True)
             await self.master.async_shutdown()
         finally:
-            await self.mcp_manager.close_all()
+            try:
+                selection = getattr(self, "model_selection", None)
+                if selection is not None:
+                    await selection.close()
+            finally:
+                await self.mcp_manager.close_all()
 
     def _load_skills(self):
         skills_dir = os.path.join(os.path.dirname(__file__), "..", "skills")
@@ -395,6 +511,10 @@ class DrxAgent:
             project_note=self.master.project_note.to_dict(),
             team=self.master._export_team_state(),
             transcript=self.transcript.export(),
+            model_selection=(
+                self.model_selection.export_selection()
+                if getattr(self, "model_selection", None) is not None else None
+            ),
         )
 
     def _setup_session_handlers(self):
@@ -472,9 +592,20 @@ class DrxAgent:
                 finally:
                     candidate.close()
 
+                selection = getattr(self, "model_selection", None)
+                saved_model = restored.get("model_selection")
+                prepared_model = None
+                if saved_model is not None:
+                    if selection is None:
+                        raise ValueError("恢复该会话需要先配置模型服务。")
+                    prepared_model = selection.prepare_restore(saved_model)
+                self._model_sequence = getattr(self, "_model_sequence", 0) + 1
                 await self.master.prepare_restore()
                 try:
                     # No await between the successful preflight barrier and commit.
+                    if prepared_model is not None:
+                        selected_model = selection.commit_restore(prepared_model)
+                        self._apply_model_context(selected_model)
                     self.transcript.restore(history)
 
                     self.knowledge_base = restored["kb"]

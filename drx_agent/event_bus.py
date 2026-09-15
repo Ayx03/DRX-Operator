@@ -26,6 +26,8 @@ class EventType(Enum):
     STATUS_UPDATE = "status_update"
     ERROR = "error"
     ACTIVITY_UPDATE = "activity_update"
+    MODEL_REQUEST = "model_request"
+    MODEL_STATE = "model_state"
 
 
 @dataclass

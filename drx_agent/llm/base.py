@@ -37,6 +37,7 @@ class LLMConfig:
     always_send_max_tokens: bool | None = None
     clamp_output_to_model_max: bool | None = None
     provider: str = ""
+    context_window: int | None = None
 
 class LLMProvider(ABC):
     @abstractmethod

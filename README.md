@@ -276,6 +276,7 @@ Costs are estimates for the known-priced portion, with cached reads and writes a
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+P` / `F1` | Search command names and descriptions; use arrows and Enter to choose |
+| `Alt+M` | Open the searchable model picker with a provider filter |
 | `Ctrl+T` | Search messages, full tool inputs/results, approvals, and worker records |
 | `Ctrl+B` | Toggle the task/Agent dashboard |
 | `Ctrl+L` | Return to the latest conversation output |
@@ -283,14 +284,18 @@ Costs are estimates for the known-priced portion, with cached reads and writes a
 | `Ctrl+S` | Interrupt the current task |
 | `Enter` | Send the current message |
 | `Shift+Enter` / `Ctrl+J` | Insert a newline; terminal paste preserves literal multiline text |
-| `Up` / `Down` in the composer | Browse history only at the visual top/bottom; otherwise move the cursor |
-| `Tab` after a slash-command prefix | Cycle matching command completions |
-| `Esc` | Close a dialog or restore a displaced draft; otherwise interrupt the current task |
+| `Up` / `Down` in the composer | Navigate visible command suggestions; otherwise browse history only at the visual top/bottom |
+| `Tab` after a slash-command prefix | Complete the highlighted suggestion and cycle matching commands |
+| `Esc` | Dismiss suggestions without clearing input, close a dialog, or restore a displaced draft; otherwise interrupt the current task |
 | `Ctrl+Shift+A` | Copy the latest Agent reply |
 | `Ctrl+Shift+T` | Copy the full session record |
 | `Cmd+C` / `Ctrl+Shift+C` | Copy selected text |
 
 Selecting `/scan`, `/exploit`, or `/target` in the command picker fills the composer without executing an incomplete command. Add the target and press Enter yourself. The picker and editor share command dispatch: `/help` displays local help without interrupting work or requesting a model response.
+
+Typing `/` opens suggestions from the same command registry. Enter completes a highlighted, incomplete command; press Enter again to execute the completed command. `/model` or the **模型** header button opens model selection; search by model/provider/host, filter by provider, and confirm with Enter. Esc cancels without changing the model or losing the editor draft.
+
+Model choices come from configured providers and their model-list APIs, not an invented global catalog. Configured/current choices remain available when discovery is unsupported or fails. `/model <model-or-provider/model>` switches directly on a unique match; ambiguous matches open the picker. The status bar shows the selected model when space permits. Switching takes effect on the next master or Worker model request; existing responses, retries, and fallback chains keep their original providers. Sessions save the selection without credentials; restoration requires the same configured source. Displayed model output capability is not the final wire limit: requests still follow the configured interface/output-budget policy.
 
 Approvals open in a separate FIFO modal showing request ID, Agent, operation, target, and risk. The editor's text and selection remain untouched. Reject is the safe default; permission prompts also offer **Always** for this session, without overriding deny rules. L4 operations require the exact phrase `I CONFIRM DESTRUCTIVE ACTION`. Stale or duplicate resolutions cannot answer another request. Only a successfully committed session restore invalidates the old UI queue; missing or invalid snapshots preserve current tasks and approvals. A covered dialog closes only after it returns to the foreground, without dismissing an unrelated window.
  
@@ -333,6 +338,11 @@ Generate a report summarizing the findings from this session
 | `/plan`                             | Switch to Plan mode (read-only tools only)                 |
 | `/act`                              | Switch to Act mode (all tools enabled)                     |
 | `/mode`                             | Show the current operating mode                            |
+| `/model`                            | Open searchable model selection                            |
+| `/model <model-or-provider/model>`   | Select a model; open the picker if ambiguous                |
+| `/model current`                    | Print the current model, endpoint host, and capabilities    |
+| `/model list [query]`               | Discover and print available models, optionally filtered    |
+| `/model refresh`                    | Refresh available models and open the picker                |
 | `/stop`, `/cancel`, or `/interrupt` | Interrupt the current task                                 |
 | `/dream`                            | Trigger deep context compaction (L6)                       |
 | `/context`                          | Show context usage                                         |

@@ -11,7 +11,7 @@ from textual.widgets.text_area import Selection
 
 from drx_agent.event_bus import EventBus, EventType, Event
 from drx_agent.tui.approval_screen import ApprovalScreen
-from drx_agent.tui.command_palette import CommandPalette, dispatch_command
+from drx_agent.tui.command_palette import CommandPalette, CommandSuggestions, dispatch_command
 
 
 class Composer(TextArea):
@@ -59,6 +59,7 @@ class Composer(TextArea):
         self._completion_seed: str | None = None
         self._completion_value: str | None = None
         self._completion_index = -1
+        self._suggestions_dismissed: str | None = None
         self._approval_requests: dict[str, tuple[int, dict[str, Any]]] = {}
         self._seen_approvals: set[str] = set()
         self._approval_screen: ApprovalScreen | None = None
@@ -108,6 +109,62 @@ class Composer(TextArea):
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area is self:
             self._resize_editor()
+            self._sync_suggestions()
+
+    def on_text_area_selection_changed(self, event: TextArea.SelectionChanged) -> None:
+        if event.text_area is self:
+            self._sync_suggestions()
+
+    def on_focus(self) -> None:
+        self.call_after_refresh(self._sync_suggestions)
+
+    def on_blur(self) -> None:
+        self._hide_suggestions()
+
+    def _suggestions(self) -> CommandSuggestions | None:
+        if not (self.is_mounted and self.is_attached):
+            return None
+        return next(iter(self.screen.query(CommandSuggestions)), None)
+
+    def _command_candidates(self) -> list[str]:
+        text = self.text
+        if (
+            self.approval_pending or not self.has_focus or self.app.screen is not self.screen
+            or self.selection.start != self.selection.end or not self.cursor_at_end_of_text
+            or not text.startswith("/") or text.count("/") != 1
+            or "\n" in text or "\r" in text or self._suggestions_dismissed == text
+        ):
+            return []
+        return [cmd for cmd, _ in CommandPalette.SLASH_COMMANDS if cmd.startswith(text)]
+
+    def _sync_suggestions(self) -> None:
+        popup = self._suggestions()
+        if popup is None:
+            return
+        if self._suggestions_dismissed != self.text:
+            self._suggestions_dismissed = None
+        candidates = self._command_candidates()
+        if candidates:
+            popup.show_candidates(candidates, self._choose_suggestion)
+        else:
+            popup.hide()
+
+    def _hide_suggestions(self) -> None:
+        popup = self._suggestions()
+        if popup is not None:
+            popup.hide()
+
+    def _visible_suggestions(self) -> CommandSuggestions | None:
+        self._sync_suggestions()
+        popup = self._suggestions()
+        return popup if popup is not None and popup.display else None
+
+    def _choose_suggestion(self, command: str) -> None:
+        if command not in self._command_candidates():
+            return
+        self.set_command_draft(command + " ")
+        self._suggestions_dismissed = self.text
+        self._hide_suggestions()
 
     def _resize_editor(self) -> None:
         if not (self.is_mounted and self.is_attached) or not self._subscribed:
@@ -174,6 +231,7 @@ class Composer(TextArea):
             if generation != self._approval_generation:
                 return
         screen = ApprovalScreen(request)
+        self._hide_suggestions()
         self._approval_screen = screen
         self.app.push_screen(screen, lambda response: self._approval_closed(screen, generation, response))
 
@@ -199,6 +257,7 @@ class Composer(TextArea):
         text = self.text
         if self.approval_pending or not text.strip():
             return
+        self._hide_suggestions()
         if not self._history or self._history[-1] != text:
             self._history.append(text)
             del self._history[:-100]
@@ -221,6 +280,7 @@ class Composer(TextArea):
         self._completion_seed = None
         self._completion_value = None
         self._completion_index = -1
+        self._suggestions_dismissed = None
 
     def _replace_text(self, text: str) -> None:
         self.load_text(text)
@@ -236,6 +296,10 @@ class Composer(TextArea):
         return row == (0 if previous else self.wrapped_document.height - 1)
 
     def action_history_previous(self) -> None:
+        popup = self._visible_suggestions()
+        if popup is not None:
+            popup.move_selection(-1)
+            return
         if self.approval_pending or not self._history or not self._at_history_boundary(previous=True):
             self.action_cursor_up()
             return
@@ -248,6 +312,10 @@ class Composer(TextArea):
         self._replace_text(self._history[self._history_index])
 
     def action_history_next(self) -> None:
+        popup = self._visible_suggestions()
+        if popup is not None:
+            popup.move_selection(1)
+            return
         if self.approval_pending or self._history_index is None or not self._at_history_boundary(previous=False):
             self.action_cursor_down()
             return
@@ -265,12 +333,17 @@ class Composer(TextArea):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "restore_draft":
             return not self.approval_pending and (
-                self._history_index is not None or self._replacement_draft is not None
+                self._visible_suggestions() is not None
+                or self._history_index is not None or self._replacement_draft is not None
             )
         return super().check_action(action, parameters)
 
     def action_restore_draft(self) -> None:
         if self.approval_pending:
+            return
+        if self._visible_suggestions() is not None:
+            self._suggestions_dismissed = self.text
+            self._hide_suggestions()
             return
         draft = self._history_draft if self._history_index is not None else self._replacement_draft
         if draft is not None:
@@ -279,6 +352,8 @@ class Composer(TextArea):
         replacement = self._replacement_draft if self._history_index is not None else None
         self._reset_navigation()
         self._replacement_draft = replacement
+        self._suggestions_dismissed = self.text
+        self._hide_suggestions()
 
     def set_command_draft(self, command: str) -> bool:
         """Prefill an editable command; Escape restores the prior draft and cursor."""
@@ -300,6 +375,12 @@ class Composer(TextArea):
             if self.approval_pending:
                 return
             if event.key == "enter":
+                popup = self._visible_suggestions()
+                if popup is not None and self.text.rstrip() not in {cmd for cmd, _ in CommandPalette.SLASH_COMMANDS}:
+                    command = popup.selected_command
+                    if command is not None:
+                        self._choose_suggestion(command)
+                    return
                 self.action_submit()
             else:
                 self.replace("\n", *self.selection, maintain_selection_offset=False)
@@ -308,7 +389,7 @@ class Composer(TextArea):
             return
         continuing = self._completion_value == self.text and self._completion_seed is not None
         seed = self._completion_seed if continuing else self.text
-        if not seed or not seed.startswith("/") or "\n" in seed or not self.cursor_at_end_of_text:
+        if not seed or not seed.startswith("/") or seed.count("/") != 1 or "\n" in seed or "\r" in seed or not self.cursor_at_end_of_text:
             return
         if self.selection.start != self.selection.end:
             return
@@ -319,7 +400,9 @@ class Composer(TextArea):
         event.stop()
         if not continuing:
             self._completion_seed = seed
-            self._completion_index = -1
+            popup = self._visible_suggestions()
+            selected = popup.selected_command if popup is not None else None
+            self._completion_index = matches.index(selected) - 1 if selected in matches else -1
             if self._replacement_draft is None and self._history_index is None:
                 self._replacement_draft = (self.text, self.selection)
         self._completion_index = (self._completion_index + 1) % len(matches)

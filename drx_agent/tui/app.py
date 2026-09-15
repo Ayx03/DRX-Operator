@@ -4,6 +4,7 @@ import asyncio
 import platform
 import subprocess
 from pathlib import Path
+from copy import deepcopy
 from rich.text import Text
 
 from textual.actions import SkipAction
@@ -11,6 +12,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal
 from textual.theme import Theme
+from textual.message import Message
 from textual.widgets import Button, Static, TextArea
 
 from drx_agent.event_bus import EventBus, EventType, Event
@@ -22,7 +24,8 @@ from drx_agent.tui.footer import StatusFooter
 from drx_agent.tui.ring import RingIndicator
 from drx_agent.tui.transcript import TranscriptLog
 from drx_agent.tui.transcript_screen import TranscriptScreen
-from drx_agent.tui.command_palette import CommandPalette
+from drx_agent.tui.command_palette import CommandPalette, CommandSuggestions
+from drx_agent.tui.model_selector import ModelSelector
 from drx_agent.session.usage import restore_usage, usage_status
 
 _CLIPBOARD_COMMANDS = {
@@ -116,6 +119,7 @@ class DrxAgentApp(App[None]):
         Binding("ctrl+s", "interrupt", "停止任务", show=False, priority=True),
         Binding("escape", "interrupt_main", "停止任务", show=False),
         Binding("ctrl+p,f1", "open_commands", "命令", show=False, priority=True),
+        Binding("alt+m", "open_models", "模型", show=False, priority=True),
         Binding("ctrl+t", "toggle_transcript", "会话记录", show=False, priority=True),
         Binding("ctrl+b", "toggle_sidebar", "工作台", show=False, priority=True),
         Binding("ctrl+l", "jump_latest", "回到最新", show=False, priority=True),
@@ -152,6 +156,75 @@ class DrxAgentApp(App[None]):
         self.theme = "drx-black"
         self._clipboard_lock = asyncio.Lock()
         self._clipboard_generation = 0
+        self._model_screen: ModelSelector | None = None
+        self._model_latest_sequence = -1
+        self._model_closed_sequence = -1
+
+    class ModelState(Message):
+        def __init__(self, data: dict) -> None:
+            super().__init__()
+            self.data = deepcopy(data)
+
+    def action_open_models(self) -> None:
+        if self._main_screen is not None and self.screen is self._main_screen:
+            self.event_bus.publish(Event(EventType.MODEL_REQUEST, {"action": "menu"}))
+
+    def _receive_model_state(self, event: Event) -> None:
+        if self._main_screen is not None:
+            self.post_message(self.ModelState(event.data))
+
+    def _reset_model_screen(self, event: Event) -> None:
+        sequence = getattr(self.drx_agent, "_model_sequence", self._model_latest_sequence + 1)
+        selection = getattr(self.drx_agent, "model_selection", None)
+        self.post_message(self.ModelState({
+            "state": "reset", "sequence": sequence,
+            "current": selection.current_key if selection is not None else None,
+        }))
+
+    def on_drx_agent_app_model_state(self, message: ModelState) -> None:
+        message.stop()
+        if self._main_screen is None or not self._main_screen.is_attached:
+            return
+        data = message.data
+        sequence = data.get("sequence", 0)
+        if not isinstance(sequence, int) or sequence < self._model_latest_sequence:
+            return
+        self._model_latest_sequence = sequence
+        current = data.get("current")
+        if current:
+            self._main_screen.query_one("#open-models", Button).tooltip = f"Alt M · 当前模型：{current}"
+        state = data.get("state")
+        screen = self._model_screen
+        if state in ("selected", "reset"):
+            self._model_closed_sequence = max(self._model_closed_sequence, sequence)
+            if screen is not None:
+                screen.invalidate()
+            return
+        if not data.get("open_menu") or sequence <= self._model_closed_sequence:
+            return
+        if screen is not None and screen.request_id == data.get("request_id"):
+            screen.update_snapshot(data)
+            return
+        if screen is not None:
+            screen.invalidate()
+        # An asynchronous discovery must never cover an approval or another dialog.
+        if self.screen is not self._main_screen:
+            self._model_closed_sequence = max(self._model_closed_sequence, sequence)
+            return
+        screen = ModelSelector(data)
+        self._model_screen = screen
+        self.push_screen(screen, lambda key: self._model_chosen(screen, sequence, key))
+
+    def _model_chosen(self, screen: ModelSelector, sequence: int, key: str | None) -> None:
+        self._model_closed_sequence = max(self._model_closed_sequence, sequence)
+        if self._model_screen is screen:
+            self._model_screen = None
+        if self._main_screen is None or not self._main_screen.is_attached:
+            return
+        if key is not None and sequence == self._model_latest_sequence:
+            self.event_bus.publish(Event(EventType.MODEL_REQUEST, {"action": "select", "key": key}))
+        if self.screen is self._main_screen:
+            self._main_screen.query_one(Composer).focus()
 
     def action_interrupt(self) -> None:
         self.event_bus.publish(Event(
@@ -212,6 +285,7 @@ class DrxAgentApp(App[None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
             "open-commands": self.action_open_commands,
+            "open-models": self.action_open_models,
             "open-transcript": self.action_toggle_transcript,
             "toggle-sidebar": self.action_toggle_sidebar,
             "stop-task": self.action_interrupt,
@@ -326,6 +400,7 @@ class DrxAgentApp(App[None]):
             yield Static("DRX", id="workspace-brand", markup=False)
             yield Static(self._workspace_name, id="workspace-context", markup=False)
             yield Button("命令", id="open-commands", tooltip="Ctrl P / F1")
+            yield Button("模型", id="open-models", tooltip="Alt M · 选择模型")
             yield Button("记录", id="open-transcript", tooltip="Ctrl T · 搜索完整会话")
             yield Button("工具", id="fold-tools", tooltip="展开或收起工具详情")
             yield Button("Agent", id="toggle-sidebar", tooltip="Ctrl B · 查看任务与成员")
@@ -336,6 +411,7 @@ class DrxAgentApp(App[None]):
                 yield Button("回到最新", id="jump-latest")
             yield Sidebar(self.event_bus)
         yield ActivityBar(self.event_bus)
+        yield CommandSuggestions(self.event_bus)
         yield Composer(self.event_bus)
         yield Static("", id="input-hints", markup=False)
         with Horizontal(id="footer-row"):
@@ -344,11 +420,17 @@ class DrxAgentApp(App[None]):
 
     async def on_mount(self) -> None:
         self._main_screen = self.screen
+        self.event_bus.subscribe(EventType.MODEL_STATE, self._receive_model_state)
+        self.event_bus.subscribe(EventType.SESSION_RESTORED, self._reset_model_screen)
         self.install_screen(TranscriptScreen(self), name="transcript_view")
         self._apply_layout()
         self.query_one(Composer).border_title = "输入"
         self.set_focus(self.query_one(Composer), scroll_visible=False)
         self.event_bus.publish(Event(type=EventType.STATUS_UPDATE, data={"text": "就绪"}))
+        selection = getattr(self.drx_agent, "model_selection", None)
+        if selection is not None:
+            self.event_bus.publish(Event(EventType.STATUS_UPDATE, {"model": selection.current_key}))
+            self.query_one("#open-models", Button).tooltip = f"Alt M · 当前模型：{selection.current_key}"
         master = getattr(self.drx_agent, "master", None)
         saved_usage = getattr(master, "session_usage", None)
         if saved_usage is not None:
@@ -368,6 +450,8 @@ class DrxAgentApp(App[None]):
             ))
 
     async def on_unmount(self) -> None:
+        self.event_bus.unsubscribe(EventType.MODEL_STATE, self._receive_model_state)
+        self.event_bus.unsubscribe(EventType.SESSION_RESTORED, self._reset_model_screen)
         self._main_screen = None
         try:
             if self.drx_agent is not None:

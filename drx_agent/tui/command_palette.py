@@ -1,5 +1,7 @@
 """Searchable command picker. Parameterized commands return an editable draft."""
 
+from collections.abc import Callable
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -20,7 +22,8 @@ def dispatch_command(event_bus: EventBus, cmd: str) -> None:
                 "Commands: /save /resume /target <host> /plan /act /mode "
                 "/memory /memory reload /image <path> [prompt] /scan <host> "
                 "/exploit <host> /status /stop /context /progress /dream "
-                "/roles /team /vote /vote cancel /memory search <query> /memory get <id>"
+                "/roles /team /vote /vote cancel /memory search <query> /memory get <id> "
+                "/model /model list [query] /model current /model refresh /model <query>"
             ),
             "source": "system",
         }))
@@ -28,6 +31,19 @@ def dispatch_command(event_bus: EventBus, cmd: str) -> None:
         event_bus.publish(Event(type=EventType.SESSION_SAVE, data={}))
     elif command == "/resume":
         event_bus.publish(Event(type=EventType.SESSION_RESTORE, data={}))
+    elif command == "/model" or command.startswith("/model "):
+        argument = command[len("/model"):].strip()
+        if not argument:
+            data = {"action": "menu"}
+        elif argument == "current":
+            data = {"action": "current"}
+        elif argument == "refresh":
+            data = {"action": "refresh"}
+        elif argument == "list" or argument.startswith("list "):
+            data = {"action": "list", "query": argument[len("list"):].strip()}
+        else:
+            data = {"action": "select", "query": argument}
+        event_bus.publish(Event(type=EventType.MODEL_REQUEST, data=data))
     elif cmd.startswith("/image "):
         rest = cmd[len("/image "):].strip()
         path, _, prompt = rest.partition(" ")
@@ -67,6 +83,10 @@ class CommandPalette(ModalScreen[str | None]):
         ("/team", "查看并发队列、成员和收束状态"),
         ("/vote", "查看全员投票及缺票成员"),
         ("/vote cancel", "撤销当前投票并停止征询"),
+        ("/model", "选择当前模型与已配置提供方"),
+        ("/model list", "列出可用模型，可追加搜索词"),
+        ("/model current", "查看当前模型"),
+        ("/model refresh", "重新发现已配置提供方的模型"),
         ("/save", "保存当前会话"),
         ("/resume", "恢复最近保存的会话"),
         ("/help", "显示命令帮助"),
@@ -200,3 +220,69 @@ class CommandPalette(ModalScreen[str | None]):
             # Pop this screen before a synchronous subscriber can open a modal.
             self.dismiss(None)
             dispatch_command(self.event_bus, cmd)
+
+
+class CommandSuggestions(OptionList, can_focus=False):
+    """Inline command descriptions; focus and draft ownership stay in Composer."""
+
+    DEFAULT_CSS = """
+    CommandSuggestions {
+        display: none;
+        height: auto;
+        max-height: 8;
+        margin: 0 1;
+        padding: 0 1;
+        border: round $panel;
+        background: $surface;
+    }
+    CommandSuggestions > .option-list--option-highlighted {
+        background: $primary 25%;
+        text-style: bold;
+    }
+    """
+
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__(id="command-suggestions", markup=False, compact=True)
+        self.event_bus = event_bus
+        self._commands: list[str] = []
+        self._on_choose: Callable[[str], None] | None = None
+
+    def show_candidates(
+        self, commands: list[str], on_choose: Callable[[str], None],
+    ) -> None:
+        self._on_choose = on_choose
+        if commands != self._commands:
+            selected = self.selected_command
+            self._commands = commands
+            descriptions = dict(CommandPalette.SLASH_COMMANDS)
+            self.clear_options()
+            self.add_options(
+                Option(Text(f"{command}  {descriptions[command]}"), id=command)
+                for command in commands
+            )
+            self.highlighted = commands.index(selected) if selected in commands else (0 if commands else None)
+        self.display = bool(commands)
+
+    @property
+    def selected_command(self) -> str | None:
+        if self.highlighted is None or self.highlighted >= self.option_count:
+            return None
+        return self.get_option_at_index(self.highlighted).id
+
+    def move_selection(self, delta: int) -> None:
+        if self.option_count:
+            self.highlighted = ((self.highlighted or 0) + delta) % self.option_count
+            self.scroll_to_highlight()
+
+    def hide(self) -> None:
+        self.display = False
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list is self:
+            event.stop()
+            if self.display and event.option.id in self._commands and self._on_choose is not None:
+                self._on_choose(event.option.id)
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list is self:
+            event.stop()
