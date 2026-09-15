@@ -24,7 +24,8 @@ class LLMConfig:
     api_key: str = ""
     base_url: str = ""
     temperature: float = 0.7
-    max_tokens: int = 4096
+    # None omits optional output limits; APIs requiring a limit need an explicit value.
+    max_tokens: int | None = None
     # Which OpenAI-style API the model endpoint speaks: "chat" (chat/completions)
     # or "responses" (v1/responses). Providers that only speak one interface
     # ignore this; it exists for routing where both are possible.

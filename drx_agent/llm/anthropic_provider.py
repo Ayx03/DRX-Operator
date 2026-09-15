@@ -176,6 +176,11 @@ class AnthropicProvider(LLMProvider):
 
     async def chat(self, messages, tools=None, stream=True):
         try:
+            if self.config.max_tokens is None:
+                raise LLMError(
+                    "Anthropic Messages requires max_tokens; configure llm.max_tokens "
+                    "explicitly for this provider."
+                )
             system, anthropic_messages = _to_anthropic_messages(messages)
             anthropic_tools = _to_anthropic_tools(tools) if tools else None
 

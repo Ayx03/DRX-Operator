@@ -6,7 +6,6 @@
     "api_key": "",
     "base_url": "https://api.deepseek.com",
     "temperature": 0.7,
-    "max_tokens": 4096,
     "context_window": 1000000,
     "verify_ssl": true,
     "proxy": null,

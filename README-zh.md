@@ -134,7 +134,6 @@ set -a && source .env && set +a
     "api_key": "",
     "base_url": "https://api.deepseek.com",
     "temperature": 0.7,
-    "max_tokens": 4096,
     "context_window": 65536,
     "retry": {
       "max_retries": 3,
@@ -145,6 +144,10 @@ set -a && source .env && set +a
   }
 }
 ```
+
+OpenAI 兼容接口和 EXO 默认不再附加客户端输出 token 上限。删除 `llm.max_tokens` 或设为 `null` 都会省略请求中的对应参数；显式填写数值仍可设置上限。服务端默认值和模型自身限制依然存在；`context_window` 用于上下文管理，不是输出长度限制。
+
+原生 [Anthropic Messages 接口](https://platform.claude.com/docs/en/api/messages/create)要求必填 `max_tokens`。使用该 Provider 时需显式设置 `llm.max_tokens`；未设置会报告配置错误，不会偷偷回退到 4096。
 
 支持的 Provider 类型：
 

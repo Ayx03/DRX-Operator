@@ -66,12 +66,13 @@ def _build_one_provider(spec: dict):
     if api_interface not in ("chat", "responses"):
         api_interface = "chat"
 
+    max_tokens = spec.get("max_tokens")
     config = LLMConfig(
         model=os.environ.get("DRX_LLM_MODEL") or spec.get("model", "deepseek-chat"),
         api_key=api_key,
         base_url=os.environ.get("DRX_LLM_BASE_URL") or spec.get("base_url", ""),
         temperature=float(spec.get("temperature", 0.7)),
-        max_tokens=int(spec.get("max_tokens", 4096)),
+        max_tokens=int(max_tokens) if max_tokens is not None else None,
         api_interface=api_interface,
     )
     try:

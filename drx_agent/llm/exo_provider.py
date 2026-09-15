@@ -115,9 +115,10 @@ class EXOProvider(LLMProvider):
             kwargs = {
                 "model": self.config.model,
                 "input": input_items if input_items else "",
-                "max_output_tokens": self.config.max_tokens,
                 "temperature": self.config.temperature,
             }
+            if self.config.max_tokens is not None:
+                kwargs["max_output_tokens"] = self.config.max_tokens
             if instructions:
                 kwargs["instructions"] = instructions
             if tools:

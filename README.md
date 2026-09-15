@@ -117,7 +117,6 @@ Edit the `llm` section in `configs/default_config.json`. Only modify non-sensiti
     "api_key": "",
     "base_url": "https://api.deepseek.com",
     "temperature": 0.7,
-    "max_tokens": 4096,
     "context_window": 65536,
     "retry": {
       "max_retries": 3,
@@ -128,6 +127,10 @@ Edit the `llm` section in `configs/default_config.json`. Only modify non-sensiti
   }
 }
 ```
+
+OpenAI-compatible and EXO requests have no client-side output-token cap by default. Omit `llm.max_tokens` or set it to `null` to leave that parameter out of the request; an explicit numeric value still sets a cap. Server defaults and model limits continue to apply. `context_window` controls context management, not output length.
+
+The native [Anthropic Messages API](https://platform.claude.com/docs/en/api/messages/create) requires `max_tokens`. Set `llm.max_tokens` explicitly when using that provider; omission produces a configuration error rather than silently imposing 4096.
 
 Supported Provider types:
 

@@ -36,10 +36,11 @@ class OpenAIProvider(LLMProvider):
         try:
             kwargs = {
                 "model": self.config.model,
-                "max_tokens": self.config.max_tokens,
                 "temperature": self.config.temperature,
                 "messages": messages,
             }
+            if self.config.max_tokens is not None:
+                kwargs["max_tokens"] = self.config.max_tokens
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
