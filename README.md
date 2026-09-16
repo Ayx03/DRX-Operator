@@ -4,6 +4,8 @@
 
 An autonomous red-team penetration testing expert system — an **Agent-First**, LLM-driven autonomous security testing platform.
 
+**Tips: Due to performance limitations of the Python version, this project is only an early concept demo. For the full version, please wait for DRX-Operator-Go.**
+
 [Python 3.10+] [Alpha]
 
 **Author**: [BushSEC](https://github.com/BushANQ) · [bushsec.cn](https://bushsec.cn)
