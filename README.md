@@ -4,7 +4,7 @@
 
 An autonomous red-team penetration testing expert system — an **Agent-First**, LLM-driven autonomous security testing platform.
 
-**Tips: Due to performance limitations of the Python version, this project is only an early concept demo. For the full version, please wait for DRX-Operator-Go.**
+**Tips: Due to the performance limitations of the Python version, this project currently serves only as an early proof-of-concept. The next-generation DRX-Operator-Go will deliver a more powerful swarm-based multi-Agent collaboration architecture, higher concurrent execution capabilities, and a significantly higher overall performance ceiling.**
 
 [Python 3.10+] [Alpha]
 
