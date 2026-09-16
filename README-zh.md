@@ -1,6 +1,7 @@
 # DRX-Operator
 
 自主红队渗透测试专家系统 —— Agent-First 架构，LLM 驱动的自主安全测试平台。
+Tips:由于Python版的性能受限，本项目仅作早期思路实现Demo，完整版请等待DRX-Operator-Go
 
 [Python 3.10+] [Alpha]
 
