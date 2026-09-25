@@ -37,6 +37,32 @@ from drx_agent.hooks.manager import HookManager
 logger = logging.getLogger(__name__)
 
 
+def _load_dotenv(dotenv_path: str | None = None) -> None:
+    """Load key-value pairs from .env into os.environ if not already set."""
+    if dotenv_path is None:
+        dotenv_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
+        )
+    if not os.path.isfile(dotenv_path):
+        return
+    try:
+        with open(dotenv_path, "r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
+
 def _build_one_provider(spec: dict):
     
     provider_name = (
@@ -677,7 +703,45 @@ class DrxAgent:
 
 
 def main() -> int:
-    """Entry point — create agent and launch TUI."""
+    """Entry point — create agent and launch TUI, or ``--web`` dashboard."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="DRX-Operator: Autonomous Red-Team Penetration Testing Expert System",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Launch the Web Dashboard (React Flow replay UI) instead of the TUI",
+    )
+    parser.add_argument(
+        "--web-port", type=int, default=7300,
+        help="Port for the web dashboard (default: 7300)",
+    )
+    parser.add_argument(
+        "--web-host", default="0.0.0.0",
+        help="Bind host for the web dashboard (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--no-agent", action="store_true",
+        help="(Web mode only) Start in replay-only mode without a live agent",
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true",
+        help="(Web mode only) Don't open the browser automatically",
+    )
+    args = parser.parse_args()
+
+    if args.web:
+        from drx_agent.web.launcher import launch_web
+        launch_web(
+            host=args.web_host,
+            port=args.web_port,
+            with_agent=not args.no_agent,
+            open_browser=not args.no_browser,
+        )
+        return 0
+
     agent = DrxAgent()
     app = DrxAgentApp(agent.event_bus, drx_agent=agent)
     app.run()

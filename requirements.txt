@@ -19,3 +19,8 @@ openai>=1.0.0
 
 # Skills 配置解析（skills/*/skill.yaml）
 pyyaml>=6.0
+
+# Web Dashboard（--web 模式，可选；不影响 TUI 启动）
+fastapi>=0.100.0
+uvicorn>=0.20.0
+websockets>=10.0
