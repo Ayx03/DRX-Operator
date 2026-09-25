@@ -10,7 +10,7 @@ An autonomous red-team penetration testing expert system — an **Agent-First**,
 
 **Author**: [BushSEC](https://github.com/BushANQ) · [bushsec.cn](https://bushsec.cn)
 
-![preview](JPG/1.jpg)
+![preview](JPG/1.1.png)
 
 ---
 

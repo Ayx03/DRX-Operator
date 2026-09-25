@@ -8,7 +8,7 @@ Tips：受限于 Python 版本的性能表现，本项目目前仅作为早期�
 
 **Author**: [BushSEC](https://github.com/BushANQ) · [bushsec.cn](https://bushsec.cn)
 
-![preview](JPG/1.jpg)
+![preview](JPG/1.1.png)
 ---
 
 DRX-Operator 是一个 Agent-First 架构的自主渗透测试系统。与传统安全工具不同，DRX-Operator
