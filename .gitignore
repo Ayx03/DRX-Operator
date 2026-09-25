@@ -43,8 +43,10 @@ skills/
 
 # Build artifacts
 dist/
+!drx_agent/web/frontend/dist/
 build/
 *.spec
+node_modules/
 
 # Vendored reference source (local only, not published)
 QWEN-EXO-booster/
